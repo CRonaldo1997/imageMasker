@@ -28,6 +28,7 @@ import glob
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -36,8 +37,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from tqdm import tqdm
+
 from src.graph import build_graph, compute_recursion_limit
 from src.graph_state import RedactionState
+from src.image_preprocess import DEFAULT_MAX_IMAGE_BYTES, maybe_shrink
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +59,7 @@ class ImageResult:
     error: Optional[str] = None
     qa_reason: Optional[str] = None
     duration_sec: float = 0.0  # 该图实际处理耗时（跳过为 0）
+    shrunk: bool = False  # 入口是否做了大图等比缩小
 
 
 @dataclass
@@ -88,6 +93,19 @@ def map_output_path(image_path: Path, input_root: Path, output_root: Path) -> Pa
     return output_root / image_path.relative_to(input_root)
 
 
+def _make_progress_bar(total: int):
+    """终端进度条；输出被重定向到文件（nohup/CI）时自动关闭，避免刷日志。"""
+    return tqdm(
+        total=total,
+        desc="脱敏进度",
+        unit="img",
+        file=sys.stdout,
+        dynamic_ncols=True,
+        leave=True,
+        disable=total <= 0 or not sys.stdout.isatty(),
+    )
+
+
 def run_batch(
     input_root: str,
     output_root: Optional[str] = None,
@@ -96,11 +114,13 @@ def run_batch(
     workers: int = 3,
     skip_existing: bool = False,
     resume: bool = True,
+    shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> dict:
     """批量脱敏入口。返回汇总报告（同时写入 batch_report.json）。
 
     resume=True（默认）：读取断点进度文件，passed 的图片跳过，
     实现断点续传；中途中断后重跑同一命令即可接着处理。
+    shrink_max_bytes：超过该字节数的图片在入口等比缩小（<=0 表示不缩小）。
     """
     root = Path(input_root).resolve()
     if not root.is_dir():
@@ -118,6 +138,15 @@ def run_batch(
     if not cases:
         return _build_report(root, out_root, [], 0.0, 0, False)
 
+    # 图片清单只扫一次：进度条需要总数，各 case 复用同一份结果
+    case_images = {case_dir: find_images(case_dir) for case_dir in cases}
+    total_images = sum(len(images) for images in case_images.values())
+    logger.info(
+        "共发现 %d 张图片（%d 个 case，并行 %d）",
+        total_images, len(cases), max(1, workers),
+    )
+    bar = _make_progress_bar(total_images)
+
     # ---- 断点进度 ----
     progress: Dict[str, dict] = {}
     resumed_from_progress = False
@@ -134,43 +163,52 @@ def run_batch(
     started = time.time()
     results: List[CaseResult] = []
 
-    if workers <= 1:
-        for case_dir in cases:
-            results.append(
-                _process_case(
-                    graph, case_dir, root, out_root, qa_enabled, max_retries,
-                    skip_existing, progress, lock,
-                )
-            )
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _process_case,
-                    graph,
-                    case_dir,
-                    root,
-                    out_root,
-                    qa_enabled,
-                    max_retries,
-                    skip_existing,
-                    progress,
-                    lock,
-                ): case_dir
-                for case_dir in cases
-            }
-            for future in as_completed(futures):
-                case_dir = futures[future]
-                try:
-                    results.append(future.result())
-                except Exception as exc:  # case 级异常不中断整批
-                    logger.exception("case %s 处理异常", case_dir.name)
-                    results.append(
-                        CaseResult(case=case_dir.name, status="error", images=[
-                            ImageResult(image=str(case_dir), status="failed", error=str(exc))
-                        ])
+    try:
+        if workers <= 1:
+            for case_dir in cases:
+                results.append(
+                    _process_case(
+                        graph, case_dir, root, out_root, qa_enabled, max_retries,
+                        skip_existing, progress, lock,
+                        images=case_images[case_dir],
+                        bar=bar,
+                        shrink_max_bytes=shrink_max_bytes,
                     )
-        results.sort(key=lambda r: r.case)
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(
+                        _process_case,
+                        graph,
+                        case_dir,
+                        root,
+                        out_root,
+                        qa_enabled,
+                        max_retries,
+                        skip_existing,
+                        progress,
+                        lock,
+                        images=case_images[case_dir],
+                        bar=bar,
+                        shrink_max_bytes=shrink_max_bytes,
+                    ): case_dir
+                    for case_dir in cases
+                }
+                for future in as_completed(futures):
+                    case_dir = futures[future]
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:  # case 级异常不中断整批
+                        logger.exception("case %s 处理异常", case_dir.name)
+                        results.append(
+                            CaseResult(case=case_dir.name, status="error", images=[
+                                ImageResult(image=str(case_dir), status="failed", error=str(exc))
+                            ])
+                        )
+            results.sort(key=lambda r: r.case)
+    finally:
+        bar.close()
 
     duration = time.time() - started
     skipped = sum(
@@ -194,8 +232,11 @@ def _process_case(
     skip_existing: bool,
     progress: Dict[str, dict],
     lock: threading.Lock,
+    images: Optional[List[Path]] = None,
+    bar=None,
+    shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> CaseResult:
-    images = find_images(case_dir)
+    images = images if images is not None else find_images(case_dir)
     result = CaseResult(case=case_dir.name)
     if not images:
         result.status = "empty"
@@ -219,6 +260,7 @@ def _process_case(
                     qa_reason=record.get("qa_reason"),
                 )
             )
+            _tick(bar)
             continue
 
         if skip_existing and output_path.exists():
@@ -226,12 +268,14 @@ def _process_case(
             result.images.append(
                 ImageResult(image=str(image_path), status="skipped", output=str(output_path))
             )
+            _tick(bar)
             continue
 
         image_result = _process_image(
-            graph, image_path, output_path, qa_enabled, max_retries
+            graph, image_path, output_path, qa_enabled, max_retries, shrink_max_bytes
         )
         result.images.append(image_result)
+        _tick(bar)
 
         # 每处理完一张立即增量落盘（原子替换，中断不丢已完成进度）
         with lock:
@@ -260,19 +304,31 @@ def _process_case(
     return result
 
 
+def _tick(bar) -> None:
+    """推进度条：跳过的图片也计数，否则进度条永远走不满。"""
+    if bar is not None:
+        bar.update(1)
+
+
 def _process_image(
     graph,
     image_path: Path,
     output_path: Path,
     qa_enabled: bool,
     max_retries: int,
+    shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> ImageResult:
     logger.info("处理 %s → %s", image_path, output_path)
     started = time.time()
     try:
+        # 大图在入口统一等比缩小：OCR/VLM/脱敏/质检全链路共用缩小后的字节，
+        # 坐标天然自洽，无需回换算。
+        image_bytes, _shrink_info = maybe_shrink(
+            image_path.read_bytes(), shrink_max_bytes
+        )
         initial_state: RedactionState = {
             "image_path": str(image_path),
-            "original_image": image_path.read_bytes(),
+            "original_image": image_bytes,
             "output_path": str(output_path),
             "qa_enabled": qa_enabled,
             "retry_count": 0,
@@ -298,6 +354,7 @@ def _process_image(
         error=result.get("error"),
         qa_reason=report.reason if report else None,
         duration_sec=round(time.time() - started, 3),
+        shrunk=_shrink_info is not None,
     )
 
 
@@ -374,6 +431,7 @@ def _build_report(
     statistics = {
         "cases_processed": len(processed_cases),                            # 处理了多少 case
         "images_processed": len(processed_images),                          # 累计处理了多少图
+        "shrunk_images": sum(1 for ir in processed_images if ir.shrunk),    # 其中做了大图缩小的张数
         "avg_case_duration_sec": round(case_duration / len(processed_cases), 2) if processed_cases else 0.0,   # 平均每个 case 处理时长
         "avg_images_per_case": round(len(processed_images) / len(processed_cases), 2) if processed_cases else 0.0,  # 平均每个 case 图像数
         "avg_image_duration_sec": round(image_duration / len(processed_images), 2) if processed_images else 0.0,  # 平均每张图处理时长
@@ -410,6 +468,8 @@ def _log_summary(report: dict) -> None:
         logger.info("---------------- 统计指标 ----------------")
         logger.info("处理 case 数：%d", stats["cases_processed"])
         logger.info("累计处理图片：%d 张", stats["images_processed"])
+        if stats.get("shrunk_images"):
+            logger.info("其中大图缩小：%d 张", stats["shrunk_images"])
         logger.info("平均每个 case 处理时长：%.2fs", stats["avg_case_duration_sec"])
         logger.info("平均每个 case 图像数：%.2f 张", stats["avg_images_per_case"])
         logger.info("平均每张图处理时长：%.2fs", stats["avg_image_duration_sec"])

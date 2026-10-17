@@ -3,6 +3,7 @@ langchain-core>=1.0,<2.0
 langchain-openai>=1.0,<2.0
 pillow>=10.0
 numpy>=1.26
+tqdm>=4.66
 python-dotenv>=1.0
 pydantic-settings>=2.0
 rapidocr>=3.0

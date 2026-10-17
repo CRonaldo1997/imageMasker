@@ -16,7 +16,31 @@ from src.config import Settings
 from src.nodes.finalize_node import finalize_node
 from src.tools.ocr_tool import OcrTool
 
-SAMPLE = "data/folder1/caseA/sub/vertical.png"
+
+@pytest.fixture(scope="module")
+def horizontal_sample(tmp_path_factory) -> str:
+    """自生成横版票据（900x560）。
+
+    不再依赖 data/ 下的本地样图：data/ 已被 .gitignore，且真实票据不应入库。
+    生成逻辑复用 `main.make_sample`，与历史夹具内容一致（OCR 块数可回归）。
+    """
+    from main import make_sample
+
+    target = tmp_path_factory.mktemp("fixture") / "bill.png"
+    try:
+        make_sample(str(target))
+    except RuntimeError as exc:  # 无中文字体（未装 fonts-noto-cjk）
+        pytest.skip(f"无法生成夹具票据图：{exc}")
+    return str(target)
+
+
+@pytest.fixture(scope="module")
+def vertical_sample(horizontal_sample, tmp_path_factory) -> str:
+    """横版顺时针 90° → 竖版（560x900），转正后应回到 900x560 且 rotation=90。"""
+    target = tmp_path_factory.mktemp("fixture_v") / "vertical.png"
+    with Image.open(horizontal_sample) as img:
+        img.convert("RGB").rotate(-90, expand=True).save(target)
+    return str(target)
 
 
 @pytest.fixture
@@ -27,10 +51,11 @@ def correct_settings(tmp_path):
 # --------------------------------------------------------------------- OCR 转正输出
 
 
-def test_extract_returns_aligned_coordinates(correct_settings):
+def test_extract_returns_aligned_coordinates(correct_settings, vertical_sample):
     """开启矫正：OCR 在转正图上跑，坐标是转正图坐标系，附带转正图字节。"""
+    pytest.importorskip("rapid_orientation", reason="需 rapid-orientation 做真实方向检测")
     tool = OcrTool(correct_settings)
-    result = tool.extract(image_path=SAMPLE)
+    result = tool.extract(image_path=vertical_sample)
 
     # 转正图尺寸（原图 560x900 竖排 → 转正 900x560 横排）
     assert result.width == 900 and result.height == 560
@@ -82,31 +107,32 @@ def test_alignment_uses_counterclockwise_rotation(correct_settings, tmp_path):
     assert aligned.getpixel((94, 5)) != (255, 0, 0)
 
 
-def test_extract_horizontal_image_not_rotated(correct_settings):
+def test_extract_horizontal_image_not_rotated(correct_settings, horizontal_sample):
     """水平图：检测为 0°，不旋转，无 aligned_image。"""
+    pytest.importorskip("rapid_orientation", reason="需 rapid-orientation 做真实方向检测")
     tool = OcrTool(correct_settings)
-    result = tool.extract(image_path="data/sample_bill.png")
+    result = tool.extract(image_path=horizontal_sample)
     assert result.rotation == 0
     assert result.aligned_image is None
     assert len(result.blocks) == 26
 
 
-def test_extract_off_by_default(tmp_path):
+def test_extract_off_by_default(tmp_path, vertical_sample):
     """显式关闭：原图直跑，转正图相关字段为空（显式传 False，避免被 .env 影响）。"""
     tool = OcrTool(
         Settings(output_dir=str(tmp_path / "out"), ocr_orientation_correct=False)
     )
-    result = tool.extract(image_path=SAMPLE)
+    result = tool.extract(image_path=vertical_sample)
     assert result.rotation == 0
     assert result.aligned_image is None
     assert len(result.blocks) == 23
 
 
-def test_orientation_engine_failure_degrades(correct_settings):
+def test_orientation_engine_failure_degrades(correct_settings, vertical_sample):
     """引擎不可用：降级原图直跑，不抛异常。"""
     tool = OcrTool(correct_settings)
     tool._orientation_failed = True
-    result = tool.extract(image_path=SAMPLE)
+    result = tool.extract(image_path=vertical_sample)
     assert result.rotation == 0
     assert len(result.blocks) == 23
 
@@ -125,9 +151,9 @@ def _redaction_result(redacted_image: bytes, width: int, height: int):
     )
 
 
-def test_finalize_restores_orientation():
+def test_finalize_restores_orientation(vertical_sample):
     """转正图（逆时针 90° 得到）经 finalize 逆操作后回到原方向，像素往返一致。"""
-    original = Image.open(SAMPLE).convert("RGB")
+    original = Image.open(vertical_sample).convert("RGB")
     original_bytes = BytesIO()
     original.save(original_bytes, format="PNG")
 
@@ -156,9 +182,9 @@ def test_finalize_no_rotation_noop():
     assert finalize_node({"rotation": 90, "redaction_result": None}) == {}
 
 
-def test_finalize_writes_output_file(tmp_path):
+def test_finalize_writes_output_file(tmp_path, vertical_sample):
     """finalize 把还原后的图写回 output_path。"""
-    original = Image.open(SAMPLE).convert("RGB")
+    original = Image.open(vertical_sample).convert("RGB")
     aligned = original.rotate(90, expand=True)
     buf = BytesIO()
     aligned.save(buf, format="PNG")

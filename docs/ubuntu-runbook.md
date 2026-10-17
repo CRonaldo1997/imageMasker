@@ -195,6 +195,13 @@ python tests/e2e_remote.py
 python main.py /data/testCase --workers 3
 ```
 
+- 启动会打印 `共发现 N 张图片（M 个 case，并行 3）`，随后显示 tqdm 进度条：
+
+  ```
+  脱敏进度: 42%|████▏     | 8/19 [02:31<03:28, 18.9s/img]
+  ```
+
+  跳过的图也计入进度，所以进度条一定走得满。进度条只在交互式终端显示，`nohup ... > run.log` 时自动关闭（日志里看每张图的 `处理 ...` 行即可）。
 - `--workers` 是 **case 级并行**（case 内图片串行，OCR 有锁）。**不要按 CPU 核数给**，建议 `min(case 数, 4)`；vLLM 是 TP=4 单实例，并发过高只会让每张图变慢、更易超时。
 - 输出默认 `/data/testCase_masked`；要换位置用 `--output /data/out`。
 
@@ -226,6 +233,8 @@ tail -f logs/run_*.log
 | `--skip-existing` | 输出文件已存在就跳过（不看断点进度） |
 | `--no-resume` | **忽略断点，全量重跑**（慎用） |
 | `--output DIR` | 指定输出根目录（会改变断点归属） |
+| `--max-image-mb 5` | 超过该大小（MB）的图先等比缩小再处理；`0`/负数 = 关闭。默认 5 |
+| `--no-shrink` | 关闭大图缩小，按原始分辨率处理 |
 
 ### 5.4 退出码
 
@@ -295,6 +304,7 @@ jq '.duration_sec, .resumed, .resumed_skipped' batch_report.json
 | `summary` | case 级状态分布 |
 | `statistics.cases_processed` | 实际处理的 case 数 |
 | `statistics.images_processed` | 实际处理的图片数（不含断点跳过） |
+| `statistics.shrunk_images` | 其中因超过阈值被等比缩小的张数 |
 | `statistics.avg_case_duration_sec` | case 耗时之和 ÷ case 数 |
 | `statistics.avg_images_per_case` | 图片数 ÷ case 数 |
 | `statistics.avg_image_duration_sec` | 图片耗时之和 ÷ 图片数 |
@@ -341,6 +351,8 @@ jq -r '.cases[] | .images[] | [.duration_sec, .status, .image] | @tsv' batch_rep
 | 竖版图方向乱 / 日志无方向矫正记录 | `OCR_ORIENTATION_CORRECT=true` 但 rapid-orientation 未装 | `pip install rapid-orientation`（未装会静默降级为原图直跑） |
 | `下发现 0 个 case` | 图片直接放在输入根目录，根目录下没有子目录 | 按 1.3 节整理成 `root/caseX/*.jpg` |
 | 断点没生效、又跑了一遍全部 | 路径/输出目录变了，或加了 `--no-resume` | 见第 6 节 |
+| 日志 `已到长边下限 800px，停止缩小` | 图体积大但已缩到保护下限 | 正常保护（再缩会掉 OCR 识别率）；想更激进就调大 `--max-image-mb`，想死守体积才改动代码里的 `MIN_LONG_SIDE` |
+| 想确认大图是否被处理 | — | 日志有 `大图缩小：12.4MB → 4.1MB，4000x3000 → 2048x1536`；或看报告的 `statistics.shrunk_images` |
 | 某个 case 状态 `error` | case 级异常（如权限、磁盘满） | 看日志 `case xxx 处理异常` 的堆栈 |
 | 跑批中途机器重启 | — | 直接重跑原命令，passed 自动跳过 |
 

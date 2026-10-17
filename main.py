@@ -19,6 +19,7 @@ from typing import Optional
 from src.config import PROJECT_ROOT
 from src.graph import build_graph, compute_recursion_limit
 from src.graph_state import RedactionState
+from src.image_preprocess import DEFAULT_MAX_IMAGE_BYTES, maybe_shrink
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -51,9 +52,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="批量模式忽略断点进度，强制全量重跑（默认启用断点续传）",
     )
+    parser.add_argument(
+        "--max-image-mb",
+        type=float,
+        default=DEFAULT_MAX_IMAGE_BYTES / 1024 / 1024,
+        help="超过该大小（MB）的图片先等比缩小再处理；0 或负数表示不缩小（默认 5）",
+    )
+    parser.add_argument(
+        "--no-shrink",
+        action="store_true",
+        help="关闭大图缩小，按原始分辨率处理",
+    )
     parser.add_argument("--make-sample", action="store_true", help="生成示例票据图后退出")
     parser.add_argument("--sample-path", default="data/sample_bill.png", help="示例图输出路径")
     return parser.parse_args()
+
+
+def shrink_limit_bytes(args: argparse.Namespace) -> int:
+    """把 CLI 的大图阈值换算成字节数；0 表示不缩小。"""
+    if args.no_shrink or args.max_image_mb is None or args.max_image_mb <= 0:
+        return 0
+    return int(args.max_image_mb * 1024 * 1024)
 
 
 def run_single(
@@ -62,9 +81,10 @@ def run_single(
     qa_enabled: bool = True,
     max_retries: int = 3,
     output_path: Optional[str] = None,
+    shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> dict:
     """对单张图片执行脱敏流水线，返回最终状态。graph 由调用方提供（批量可复用）。"""
-    image_bytes = Path(image_path).read_bytes()
+    image_bytes, _ = maybe_shrink(Path(image_path).read_bytes(), shrink_max_bytes)
 
     initial_state: RedactionState = {
         "image_path": image_path,
@@ -85,9 +105,17 @@ def run_single(
     return result
 
 
-def run(image_path: str, qa_enabled: bool = True, max_retries: int = 3) -> dict:
+def run(
+    image_path: str,
+    qa_enabled: bool = True,
+    max_retries: int = 3,
+    shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> dict:
     """单图 CLI 入口。"""
-    return run_single(build_graph(), image_path, qa_enabled, max_retries)
+    return run_single(
+        build_graph(), image_path, qa_enabled, max_retries,
+        shrink_max_bytes=shrink_max_bytes,
+    )
 
 
 def _print_summary(state: RedactionState) -> None:
@@ -189,6 +217,7 @@ def _load_cjk_font(size: int):
 
 def main() -> int:
     args = parse_args()
+    shrink_max_bytes = shrink_limit_bytes(args)
 
     if args.make_sample:
         make_sample(args.sample_path)
@@ -201,6 +230,11 @@ def main() -> int:
     if not target.exists():
         logger.error("路径不存在: %s", args.image)
         return 1
+
+    if shrink_max_bytes > 0:
+        logger.info("大图预处理：超过 %.1fMB 的图片将等比缩小后处理", shrink_max_bytes / 1024 / 1024)
+    else:
+        logger.info("大图预处理：已关闭（按原始分辨率处理）")
 
     if args.method:
         import os
@@ -219,6 +253,7 @@ def main() -> int:
             workers=args.workers,
             skip_existing=args.skip_existing,
             resume=not args.no_resume,
+            shrink_max_bytes=shrink_max_bytes,
         )
         bad = {
             k: v
@@ -227,7 +262,12 @@ def main() -> int:
         }
         return 1 if bad else 0
 
-    result = run(str(target), qa_enabled=not args.no_qa, max_retries=args.max_retries)
+    result = run(
+        str(target),
+        qa_enabled=not args.no_qa,
+        max_retries=args.max_retries,
+        shrink_max_bytes=shrink_max_bytes,
+    )
     return 0 if result.get("status") == "passed" else 1
 
 

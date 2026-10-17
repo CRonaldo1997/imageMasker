@@ -1,6 +1,6 @@
 # imageMask — 医疗票据图片隐私脱敏工具
 
-基于 **LangGraph + OCR + VLM** 的确定性脱敏流水线，支持批量跑批、断点续传、文字方向矫正、假数据等长替换。
+基于 **LangGraph + OCR + VLM** 的确定性脱敏流水线，支持批量跑批（tqdm 进度）、断点续传、大图等比缩小、文字方向矫正、假数据等长替换。
 
 > **本文档面向后续接手维护/开发的编程 AI**：先读「架构与核心机制」和「踩坑记录」再动手；
 > 改任何节点前先看「约束与禁止项」。
@@ -93,6 +93,7 @@ START → ocr → vlm → redact → qa → route_after_qa
 
 - case = 输入文件夹的直接子目录；图片发现用 `glob(**/*, recursive=True)`；
 - 输出**完全镜像**输入相对路径与文件名，仅顶层目录加 `_masked`（`folder1 → folder1_masked`）；
+- 启动时先扫出图片总数并打印 `共发现 N 张图片`，随后用 **tqdm 进度条**展示实时进度（跳过的图也计数，保证走得满）；进度条只在 TTY 下显示，`nohup`/重定向到文件时自动关闭，避免刷日志；
 - 断点：每处理完一张图立即原子写 `batch_progress.json`（临时文件 + `os.replace`），passed 的图重启后跳过，failed/max_retry 重试；`--no-resume` 强制全量；
 - 并行粒度是 **case**（case 内图片串行），避免打爆 VLM API；进度写盘有 `threading.Lock` 保护；
 - 汇总报告 `batch_report.json`（含每图状态/输出/QA 结论/耗时）。
@@ -106,6 +107,14 @@ START → ocr → vlm → redact → qa → route_after_qa
 - 引擎缺失自动降级为原图直跑（不阻断）。
 
 ---
+
+### 3.6 大图预处理（`src/image_preprocess.py`）
+
+- 入口统一做：**超过阈值（默认 5MB）的图片等比缩小后重编码**，再进入 OCR/VLM/脱敏/质检/finalize。全链路共用缩小后的同一份字节，**坐标天然自洽，无需反变换**；
+- 只缩不裁、保持宽高比；**输出编码格式与输入一致**（JPEG 仍 JPEG、PNG 仍 PNG），不破坏「扩展名与内容格式一致」（坑 #15）；
+- 缩小策略：按 `0.85` 逐轮缩放 + 重编码，直到体积达标或长边触到 `MIN_LONG_SIDE=800`（再缩会明显掉 OCR 识别率），最多 8 轮；
+- 降级：无法解码 / 重编码失败 / 结果反而更大时**一律返回原始字节**并告警，预处理不能成为新的故障点；
+- 开关：`--max-image-mb <MB>` 调阈值（`0` 或负数 = 关闭），`--no-shrink` 直接关闭；命中缩小的张数计入报告 `statistics.shrunk_images` 与每图 `shrunk` 字段。
 
 ## 4. 数据契约
 
@@ -137,10 +146,11 @@ src/
 ├── graph_state.py       RedactionState
 ├── sensitive_rules.py   正则规则通道（与 VLM 取并集，按 block_id 去重 VLM 优先）
 ├── fake_data.py         FakeDataMapper（确定性等长假数据）
+├── image_preprocess.py  入口大图等比缩小（>5MB，可 --no-shrink 关闭）
 ├── schemas/             5 个 Pydantic 模型
 ├── tools/               4 个工具 + 懒加载单例门面（tests 可向 _cache 注入假工具）
 └── nodes/               6 个节点 + common.py（fail/already_failed/require 辅助）
-tests/                   95 个单测 + conftest（隔离 .env）+ e2e_local/remote
+tests/                   130 个单测 + conftest（隔离 .env）+ e2e_local/remote
 ```
 
 **常见扩展点**：
@@ -221,6 +231,8 @@ python main.py data/ticket.png
 python main.py data/folder1 --workers 4
 # 强制全量 / 跳过已有输出 / 关质检 / 指定脱敏方式
 python main.py data/folder1 --no-resume | --skip-existing | --no-qa | --method blur
+# 大图预处理（默认 >5MB 等比缩小）：关闭 / 改阈值
+python main.py data/folder1 --no-shrink | --max-image-mb 10
 # 生成示例票据
 python main.py --make-sample
 ```
@@ -234,12 +246,12 @@ python main.py --make-sample
 ## 9. 测试与验证入口
 
 ```bash
-python -m pytest tests/ -q                 # 95 个单测（无需 VLM/网络，秒级）
+python -m pytest tests/ -q                 # 130 个单测（无需 VLM/网络，秒级）
 python tests/e2e_local.py                  # 本地全链路（启发式假 VLM + 真实 OCR/脱敏/质检）
 python tests/e2e_remote.py                 # 真实 VLM 全链路（需 .env 配好 API Key）
 ```
 
-测试文件职责：`test_graph`（流程/路由/失败传播）、`test_tools`（脱敏像素/质检判定/假数据不误报）、`test_fake_data`（映射确定性/等长/合法性）、`test_batch`（glob/镜像/断点/并行）、`test_rotation`（四边形角度/误伤）、`test_orientation`（转正坐标系/finalize 往返/方向语义）。`fakes.py` 提供全套测试替身；新工具签名变化时先同步 fakes。
+测试文件职责：`test_graph`（流程/路由/失败传播）、`test_tools`（脱敏像素/质检判定/假数据不误报）、`test_fake_data`（映射确定性/等长/合法性）、`test_batch`（glob/镜像/断点/并行/大图缩小）、`test_preprocess`（缩小阈值/等比/格式一致/降级）、`test_rotation`（四边形角度/误伤）、`test_orientation`（转正坐标系/finalize 往返/方向语义，夹具图用 `make_sample` 在 tmp 目录自生成，不依赖 data/）。`fakes.py` 提供全套测试替身；新工具签名变化时先同步 fakes。
 
 **改完必跑**：`pytest tests/ -q` 全绿 + 至少一次 `e2e_local`；涉及 VLM/方向/假数据的改动再跑 `e2e_remote`。
 

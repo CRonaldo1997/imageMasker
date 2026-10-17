@@ -327,6 +327,86 @@ def test_corrupted_progress_falls_back(sample_tree, tmp_path):
     assert report["resumed_skipped"] == 0
 
 
+def test_progress_bar_tracks_all_images(sample_tree, tmp_path, monkeypatch):
+    """进度条总数 = 全部图片数；跳过的图也计数；结束时必须关闭。"""
+    from src import batch as batch_mod
+
+    class FakeBar:
+        def __init__(self):
+            self.count = 0
+            self.closed = False
+
+        def update(self, n=1):
+            self.count += n
+
+        def close(self):
+            self.closed = True
+
+    totals = []
+    bar = FakeBar()
+    monkeypatch.setattr(
+        batch_mod, "_make_progress_bar",
+        lambda total: (totals.append(total), bar)[1],
+    )
+    _inject_fakes()
+
+    out_root = tmp_path / "out_bar"
+    run_batch(str(sample_tree), output_root=str(out_root), workers=1)
+    assert totals == [4]           # 2 个 case 共 4 张图
+    assert bar.count == 4
+    assert bar.closed is True
+
+    # 第二轮全部走断点跳过，进度条同样要走满
+    bar2 = FakeBar()
+    monkeypatch.setattr(batch_mod, "_make_progress_bar", lambda total: bar2)
+    run_batch(str(sample_tree), output_root=str(out_root), workers=1)
+    assert bar2.count == 4
+    assert bar2.closed is True
+
+
+def test_run_batch_shrinks_large_images(tmp_path):
+    """批量入口按阈值缩小大图，并在统计里体现张数。"""
+    import os
+
+    from PIL import Image
+
+    _inject_fakes()
+    root = tmp_path / "folder_shrink"
+    (root / "caseA").mkdir(parents=True)
+    img = Image.frombytes("RGB", (1200, 1200), os.urandom(1200 * 1200 * 3))
+    img.save(root / "caseA" / "big.png")
+    assert (root / "caseA" / "big.png").stat().st_size > 200_000
+
+    report = run_batch(
+        str(root), output_root=str(tmp_path / "out_shrink"),
+        workers=1, shrink_max_bytes=200_000,
+    )
+    assert report["summary"] == {"passed": 1}
+    assert report["statistics"]["shrunk_images"] == 1
+    image_result = report["cases"][0]["images"][0]
+    assert image_result["shrunk"] is True
+
+
+def test_run_batch_can_disable_shrink(tmp_path):
+    """shrink_max_bytes=0 时保持原图（--no-shrink 的等价行为）。"""
+    import os
+
+    from PIL import Image
+
+    _inject_fakes()
+    root = tmp_path / "folder_noshrink"
+    (root / "caseA").mkdir(parents=True)
+    img = Image.frombytes("RGB", (1200, 1200), os.urandom(1200 * 1200 * 3))
+    img.save(root / "caseA" / "big.png")
+
+    report = run_batch(
+        str(root), output_root=str(tmp_path / "out_noshrink"),
+        workers=1, shrink_max_bytes=0,
+    )
+    assert report["statistics"]["shrunk_images"] == 0
+    assert report["cases"][0]["images"][0]["shrunk"] is False
+
+
 def test_progress_input_mismatch_ignored(tmp_path):
     """进度属于另一个输入目录时忽略断点。"""
     import json
