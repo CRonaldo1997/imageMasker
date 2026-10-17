@@ -1,0 +1,21 @@
+langgraph>=1.0,<2.0
+langchain-core>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+pillow>=10.0
+numpy>=1.26
+python-dotenv>=1.0
+pydantic-settings>=2.0
+rapidocr>=3.0
+opencv-python>=4.10
+pytest>=8.0
+
+# 可选：全局方向矫正（OCR_ORIENTATION_CORRECT=true 时需要）
+# rapid-orientation>=0.0.11
+
+# ---------------------------------------------------------------------------
+# Ubuntu 部署注意：
+#   1. opencv 需要系统库：sudo apt install -y libgl1 libglib2.0-0
+#      （无头服务器也可改装 opencv-python-headless 替代 opencv-python）
+#   2. 假数据重绘需要中文字体：sudo apt install -y fonts-noto-cjk
+#   3. Python 3.11（paddle 引擎才需要；rapid 3.10+ 亦可）
+# ---------------------------------------------------------------------------
