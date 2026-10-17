@@ -15,7 +15,7 @@ class RedactedBlock(BaseModel):
     points: List[List[int]] = Field(default_factory=list)
     angle: float = Field(default=0.0)
     method: str = "white_mask"
-    source: str = "vlm"  # vlm / rule / qr
+    source: str = "vlm"  # vlm / rule
 
 
 class RedactionResult(BaseModel):

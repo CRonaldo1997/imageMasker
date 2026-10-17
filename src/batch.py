@@ -24,7 +24,6 @@
 """
 from __future__ import annotations
 
-import glob
 import json
 import logging
 import os
@@ -41,7 +40,11 @@ from tqdm import tqdm
 
 from src.graph import build_graph, compute_recursion_limit
 from src.graph_state import RedactionState
-from src.image_preprocess import DEFAULT_MAX_IMAGE_BYTES, maybe_shrink
+from src.image_preprocess import (
+    DEFAULT_MAX_IMAGE_BYTES,
+    maybe_shrink,
+    normalize_exif_orientation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +79,15 @@ def find_cases(input_root: Path) -> List[Path]:
 
 
 def find_images(case_dir: Path) -> List[Path]:
-    """glob 递归收集 case 内所有图片（大小写不敏感的扩展名）。"""
-    pattern = str(case_dir / "**" / "*")
-    files = glob.glob(pattern, recursive=True)
+    """递归收集 case 内所有图片（大小写不敏感的扩展名）。
+
+    用 Path.rglob 而不是 glob.glob(case_dir/**/*)：glob 会把整个路径
+    当模式解析，case 目录名里只要出现 [ ] * ?（如 "case[1]"）就会匹配
+    不到任何图片，静默变成 empty case。rglob 只对最后一段做通配。
+    """
     return sorted(
-        Path(f) for f in files if Path(f).is_file() and Path(f).suffix.lower() in IMAGE_EXTENSIONS
+        p for p in case_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
 
 
@@ -131,7 +138,25 @@ def run_batch(
         if output_root
         else root.parent / f"{root.name}_masked"
     )
-    out_root.mkdir(parents=True, exist_ok=True)
+    # 输出目录绝不能是输入目录本身或其子目录：那会把脱敏结果写回原图位置，
+    # 直接违反「原图必须保留」的硬约束；而且下一次运行时输出目录会被当成
+    # 新的 case 扫进去，造成重复脱敏、进度文件无限增长。
+    if out_root == root or root in out_root.parents:
+        raise ValueError(
+            f"输出目录不能位于输入目录之内（输入 {root}，输出 {out_root}）；"
+            "请使用默认的 <输入名>_masked 或输入目录之外的路径"
+        )
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(f"无法创建输出目录 {out_root}：{exc}") from exc
+    # 清理上次中断可能残留的进度临时文件（写一半被杀会留下 *.tmp，
+    # 不清就会在输出目录里越积越多）
+    for stale in out_root.glob("*.tmp"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
     cases = find_cases(root)
     logger.info("输入 %s 下发现 %d 个 case，输出目录 %s", root, len(cases), out_root)
@@ -167,7 +192,7 @@ def run_batch(
         if workers <= 1:
             for case_dir in cases:
                 results.append(
-                    _process_case(
+                    _safe_process_case(
                         graph, case_dir, root, out_root, qa_enabled, max_retries,
                         skip_existing, progress, lock,
                         images=case_images[case_dir],
@@ -176,10 +201,15 @@ def run_batch(
                     )
                 )
         else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+            # 不用 with：ThreadPoolExecutor.__exit__ 会 shutdown(wait=True)，
+            # 把所有已提交的 case 跑完才返回——大批量时 Ctrl+C 要等几小时。
+            # 这里手动管理：收到中断/异常时取消还没开跑的 case，只让在跑的
+            # 那几个（≤ workers）收尾；进度靠每张图即时落盘保证不丢。
+            pool = ThreadPoolExecutor(max_workers=workers)
+            try:
                 futures = {
                     pool.submit(
-                        _process_case,
+                        _safe_process_case,
                         graph,
                         case_dir,
                         root,
@@ -199,14 +229,19 @@ def run_batch(
                     case_dir = futures[future]
                     try:
                         results.append(future.result())
-                    except Exception as exc:  # case 级异常不中断整批
+                    except Exception as exc:  # 兜底：即便 _safe_process_case 也炸了
                         logger.exception("case %s 处理异常", case_dir.name)
                         results.append(
                             CaseResult(case=case_dir.name, status="error", images=[
                                 ImageResult(image=str(case_dir), status="failed", error=str(exc))
                             ])
                         )
-            results.sort(key=lambda r: r.case)
+            except BaseException:
+                # KeyboardInterrupt 也走这里：取消排队中的 case 后原样抛出
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            pool.shutdown(wait=True)
+        results.sort(key=lambda r: r.case)
     finally:
         bar.close()
 
@@ -220,6 +255,23 @@ def run_batch(
     report = _build_report(root, out_root, results, duration, skipped, resumed_from_progress)
     _log_summary(report)
     return report
+
+
+def _safe_process_case(graph, case_dir: Path, *args, **kwargs) -> CaseResult:
+    """单个 case 的受保护执行：异常降级为该 case 的 error 结果。
+
+    顺序模式（--workers 1）此前不设保护，一次写盘失败/权限问题就会
+    中断整批且不产报告；并行模式则只是丢掉这个 case。两边统一。
+    """
+    try:
+        return _process_case(graph, case_dir, *args, **kwargs)
+    except Exception as exc:
+        logger.exception("case %s 处理异常", case_dir.name)
+        return CaseResult(
+            case=case_dir.name,
+            status="error",
+            images=[ImageResult(image=str(case_dir), status="failed", error=str(exc))],
+        )
 
 
 def _process_case(
@@ -251,17 +303,26 @@ def _process_case(
         # 断点续传：已成功的图片直接跳过
         record = progress.get(key)
         if record and record.get("status") == "passed":
-            logger.info("断点跳过（已完成）：%s", image_path)
-            result.images.append(
-                ImageResult(
-                    image=str(image_path),
-                    status="skipped",
-                    output=record.get("output") or str(output_path),
-                    qa_reason=record.get("qa_reason"),
+            # 续跑前确认产物还在：进度说 passed 但输出被删/移走时不能静默
+            # 跳过——那等于对外宣称处理完成，实际什么都没有。
+            recorded = record.get("output")
+            expected = Path(recorded) if recorded else output_path
+            if expected.exists():
+                logger.info("断点跳过（已完成）：%s", image_path)
+                result.images.append(
+                    ImageResult(
+                        image=str(image_path),
+                        status="skipped",
+                        output=str(expected),
+                        qa_reason=record.get("qa_reason"),
+                    )
                 )
+                _tick(bar)
+                continue
+            logger.warning(
+                "断点记录显示已完成但输出文件缺失，重新处理：%s（期望 %s）",
+                image_path, expected,
             )
-            _tick(bar)
-            continue
 
         if skip_existing and output_path.exists():
             logger.info("跳过已存在输出：%s", output_path)
@@ -321,11 +382,10 @@ def _process_image(
     logger.info("处理 %s → %s", image_path, output_path)
     started = time.time()
     try:
-        # 大图在入口统一等比缩小：OCR/VLM/脱敏/质检全链路共用缩小后的字节，
-        # 坐标天然自洽，无需回换算。
-        image_bytes, _shrink_info = maybe_shrink(
-            image_path.read_bytes(), shrink_max_bytes
-        )
+        # 入口先按 EXIF 方向转正，再对大图等比缩小：OCR/VLM/脱敏/质检
+        # 全链路共用同一份字节，坐标天然自洽，无需回换算。
+        image_bytes, _ = normalize_exif_orientation(image_path.read_bytes())
+        image_bytes, _shrink_info = maybe_shrink(image_bytes, shrink_max_bytes)
         initial_state: RedactionState = {
             "image_path": str(image_path),
             "original_image": image_bytes,
@@ -347,9 +407,18 @@ def _process_image(
 
     redaction = result.get("redaction_result")
     report = result.get("qa_report")
+    # 图的最终状态只认这三种；出现 processing 之类的中间态（理论上到不了
+    # END，但防御性处理）必须按 failed 记——否则会被算进 passed，
+    # 退出码 0、报告显示成功，实际产物可能不完整。
+    status = result.get("status", "failed")
+    if status not in ("passed", "failed", "max_retry"):
+        logger.error(
+            "图片 %s 结束状态异常（%r），按 failed 记录", image_path, status
+        )
+        status = "failed"
     return ImageResult(
         image=str(image_path),
-        status=result.get("status", "failed"),
+        status=status,
         output=str(redaction.output_path) if redaction else None,
         error=result.get("error"),
         qa_reason=report.reason if report else None,
@@ -448,7 +517,14 @@ def _build_report(
         "cases": [asdict(case) for case in results],
     }
     report_path = output_root / "batch_report.json"
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except OSError as exc:
+        # 跑了几小时最后一步写不了报告，不该以一个裸 traceback 收场：
+        # 统计已经会打到日志里，这里降级为错误日志继续返回。
+        logger.error("汇总报告写入失败（%s）；统计信息已输出到日志", exc)
     report["report_path"] = str(report_path)
     return report
 

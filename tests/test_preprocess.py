@@ -7,7 +7,11 @@ from io import BytesIO
 import pytest
 from PIL import Image
 
-from src.image_preprocess import DEFAULT_MAX_IMAGE_BYTES, maybe_shrink
+from src.image_preprocess import (
+    DEFAULT_MAX_IMAGE_BYTES,
+    maybe_shrink,
+    normalize_exif_orientation,
+)
 
 
 def _noise_image(width: int, height: int, fmt: str = "PNG", quality: int = 95) -> bytes:
@@ -153,3 +157,45 @@ def test_info_fields(fmt):
     }
     assert info["format"] == fmt
     assert info["original_size"] == [1200, 800]
+
+
+# ------------------------------------------------------------------ EXIF 方向
+
+
+def _jpeg_with_orientation(width: int, height: int, orientation: int) -> bytes:
+    img = Image.new("RGB", (width, height), "white")
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    buf = BytesIO()
+    img.save(buf, format="JPEG", exif=exif.tobytes())
+    return buf.getvalue()
+
+
+def test_exif_orientation_is_normalized():
+    """手机照片（Orientation=6，像素横向）必须转正，否则输出图横躺。"""
+    data = _jpeg_with_orientation(40, 20, 6)
+
+    out, info = normalize_exif_orientation(data)
+
+    assert info is not None
+    assert info["orientation"] == 6
+    assert info["original_size"] == [40, 20]
+    with Image.open(BytesIO(out)) as img:
+        assert img.size == (20, 40)          # 像素已转正
+        assert int(img.getexif().get(0x0112, 1) or 1) == 1  # 残留 EXIF 方向已清除
+    assert _magic(out) == "JPEG"             # 格式与输入一致
+
+
+def test_exif_absent_or_upright_returns_original_bytes():
+    """无 EXIF / Orientation=1：字节完全不变，不做无谓重编码。"""
+    png = _noise_image(64, 64)
+    assert normalize_exif_orientation(png) == (png, None)
+
+    upright = _jpeg_with_orientation(40, 20, 1)
+    assert normalize_exif_orientation(upright) == (upright, None)
+
+
+def test_exif_corrupted_bytes_pass_through():
+    """无法解码时原样返回，预处理不抛异常。"""
+    data = b"\x00" * 1000
+    assert normalize_exif_orientation(data) == (data, None)

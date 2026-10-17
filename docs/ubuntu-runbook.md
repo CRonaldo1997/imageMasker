@@ -46,11 +46,13 @@ source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
 
-# 开启方向矫正才需要（.env.production 里 OCR_ORIENTATION_CORRECT=true）
-pip install rapid-orientation
+# 方向矫正：.env.production 里 OCR_ORIENTATION_CORRECT=true，必须装这个，
+# 否则会静默降级为原图直跑（只有一条 warning，竖版票据识别率下降）
+pip install rapid-orientation==0.0.11
 ```
 
-> 内网无外网时用内网镜像：`pip install -r requirements.txt -i http://<内网pypi>/simple --trusted-host <host>`。
+> 内网无外网也能装：`rapidocr` 的 ONNX 模型打在 wheel 里，不需要运行时联网下载；用内网镜像即可 `pip install -r requirements.txt -i http://<内网pypi>/simple --trusted-host <host>`。
+> `requirements.txt` 全部锁了确切版本（就是跑过 167 个单测 + `e2e_local` 的那套环境）；升级任何包之前先在本地跑一遍 `pytest tests/ -q` 和 `e2e_local`。
 > 无 GPU 的机器也能跑本工具（OCR 走 CPU onnxruntime），只要求能访问 vLLM 的 HTTP 接口。
 
 ### 1.3 目录约定（很重要）
@@ -94,7 +96,6 @@ OCR_ENGINE=rapid
 OCR_ORIENTATION_CORRECT=true           # 需已装 rapid-orientation
 DEFAULT_METHOD=white_mask              # white_mask（假数据重绘）| blur | mosaic
 FAKE_DATA_ENABLED=true                 # 等长假数据替换
-DETECT_QR_CODES=true
 ```
 
 ### 2.2 生效方式
@@ -171,6 +172,8 @@ cd /opt/imageMask && source .venv/bin/activate
 export IMAGE_MASK_ENV_FILE=/opt/imageMask/.env.production
 
 # ① 单元测试：不需要网络和 VLM，秒级，验证代码/依赖完整
+#    装了 rapid-orientation 应为 167 passed；
+#    没装则 2 个方向矫正测试 skip（165 passed, 2 skipped）——出现 skip 就先补装
 python -m pytest tests/ -q
 
 # ② 生成示例票据 + 单图全链路（会真的调 vLLM）
@@ -184,6 +187,8 @@ python tests/e2e_remote.py
 ```
 
 任一步失败**不要开始跑批**，先按第 8 节排查。
+
+**VLM 调用量预算**（API 有配额时先算这个）：每张图固定 **2 次**调用（敏感判断 1 + 语义质检 1）；质检不通过时每次重试再 +2。上面这套冒烟约 6~10 次调用。排障时可给单图加 `--no-qa` 降到 1 次/张（但会连确定性质检一起关，仅限排障）。
 
 ---
 
@@ -264,6 +269,18 @@ python -u main.py /data/testCase --workers 3 >> logs/run_resume.log 2>&1
 1. 命令里加了 `--no-resume` → 忽略进度，全量重跑；
 2. 输入根路径变了（比如从 `/data/testCase` 换成 `/data/testcase` 或软链接路径）→ 进度里存的是绝对路径字符串，对不上就整批忽略；
 3. 换了 `--output` 目录 → 新目录没有进度文件，等于从零开始。
+
+**中断后的行为保证**（都有测试固化：`pytest tests/test_batch.py -k "kill_mid or ctrl_c"`）：
+
+| 场景 | 行为 |
+|---|---|
+| `kill -9` / 断电 | 进度文件是「临时文件 + `os.replace`」原子写，最多丢正在处理的那 1 张；报告没写也不要紧，续跑会重写 |
+| Ctrl+C（并行模式） | 只取消**排队中**的 case，在跑的那几个收尾后立刻退出（不会把剩下几百个 case 跑完）；进度不丢 |
+| 进度说 passed 但输出文件被删 | 续跑时重新处理该图，不会静默跳过 |
+| `--output` 指到输入目录里面 | 直接报错退出（防止把脱敏结果写回原图位置） |
+| 跑到一半磁盘写满 | 该 case 记 `error`，批次继续跑完并照常出报告；报告写不成功时只打错误日志，不丢统计 |
+
+> 续跑完成后 `summary` 里可能出现 `skipped`（整个 case 的图都是断点跳过的），这是正常状态，不是失败。
 
 > 想彻底重来：用 `--no-resume`，**不要**手动删 `batch_progress.json`（删了也行，但 `--no-resume` 语义更清晰、不会误伤别的状态）。
 
@@ -401,7 +418,45 @@ python main.py /data/one/ticket.jpg --method blur
 
 ---
 
-## 11. 附：开机自启（可选）
+## 11. 附：性能排查（单张 ~12s 是正常的，想更快看这里）
+
+单张耗时构成（本地实测 + 27B 估值）：OCR 首轮 ~1.4s + VLM 判断 2~4s + 脱敏 <0.01s + 质检重 OCR ~1.4s + VLM 质检 3~6s ≈ **VLM 占 70%，OCR 占 25%**。
+
+**已实现的并发**：确定性预检（重 OCR + 正则 + 几何误伤）默认放后台线程，与 VLM 语义质检同时跑，`verify` 从 `重OCR + VLM` 变成 `max(重OCR, VLM)`，单张省 ~1.2~1.5s（`QA_PRECHECK_BACKGROUND=false` 可关）。
+**实测无效的弯路**（别再试）：并发 OCR——20 核 CPU 上 4 张并发，1 实例 5.7s vs 4 实例 12~14.5s，onnxruntime 单会话已吃满全部核心，多会话互相争抢；多进程同理，只增加断点/进度协调复杂度；asyncio 也没有可并发部分（单张图内是严格数据依赖，跨图 I/O 重叠已由 case 级线程池承担）。
+
+按顺序排查：
+
+```bash
+# ① 思考模式是否真的关掉（最重要）
+grep "思考模式" logs/run_*.log
+#   期望：VLM 思考模式：已关闭（extra_body={'chat_template_kwargs': {'enable_thinking': False}}）
+#   若出现「不被服务端接受…改试 …」→ 该 vLLM 不认这种写法，工具已自动换写法，看下一行确认
+#   若出现「所有参数写法均被服务端拒绝」→ 思考模式没关掉：结构化输出不稳、单张慢数秒，
+#     升级 vLLM（或临时设 VLM_ENABLE_THINKING=true 并接受代价，不推荐）
+
+# ② 两次 VLM 调用各花多久、prompt/generation token 多少（看 vLLM 日志或 /metrics）
+curl -s http://172.16.84.211:8000/metrics | grep -E "ttft|generation_tokens|prompt_tokens"
+
+# ③ 是不是并发互相排队：同样数据分别用 --workers 1 和 3 跑 10 张，比较 avg_image_duration_sec
+```
+
+可调项（改 `.env.production` 后重启进程生效）：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| `QA_PRECHECK_BACKGROUND` | true | 质检预检与 VLM 并发跑，单张省 ~1.2~1.5s；false = 串行且给 VLM 带预检 hints |
+| `VLM_QA_MASK_IMAGE_SIDE` | 512 | 质检「脱敏图」长边，vision token 约为 1024 的 1/4；0 = 跟随 `VLM_MAX_IMAGE_SIDE` |
+| `VLM_MAX_IMAGE_SIDE` | 1024 | 降到 768 可再省 ~44% 图像 token，先用几张真实票据对比 QA 通过率 |
+| `QA_REOCR_MAX_SIDE` | 1280 | 质检重 OCR 先缩小，实测省 ~0.2s/张；0 = 不缩放 |
+| `OCR_ENGINE_INSTANCES` | 1 | OCR 引擎实例数。CPU 上并发只会更慢，保持 1；只有限制每会话线程数或换 GPU 推理时才调大 |
+| `--workers` | 3 | OCR 阶段 CPU 已饱和（串行），超过 4 只会让 vLLM 排队、单张更慢 |
+
+注意：`--no-qa` 会连确定性质检一起关（残留/正则/误伤全部不查），只用于排障，**不要用于正式跑批**。
+
+---
+
+## 12. 附：开机自启（可选）
 
 `/etc/systemd/system/imagemask-batch.service`：
 
@@ -409,6 +464,7 @@ python main.py /data/one/ticket.jpg --method blur
 [Unit]
 Description=imageMask batch redaction
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -416,6 +472,8 @@ User=youruser
 WorkingDirectory=/opt/imageMask
 Environment=IMAGE_MASK_ENV_FILE=/opt/imageMask/.env.production
 Environment=PYTHONIOENCODING=utf-8
+# logs 目录不存在时 systemd 打不开 append 目标，服务会直接起不来
+ExecStartPre=/bin/mkdir -p /opt/imageMask/logs
 ExecStart=/opt/imageMask/.venv/bin/python -u main.py /data/testCase --workers 3
 StandardOutput=append:/opt/imageMask/logs/systemd.log
 StandardError=append:/opt/imageMask/logs/systemd.log

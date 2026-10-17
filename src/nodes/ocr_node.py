@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 
 from src.graph_state import RedactionState
-from src.nodes.common import already_failed, fail, require
+from src.nodes.common import already_failed, fail
 from src.tools import get_ocr_tool
 
 logger = logging.getLogger(__name__)

@@ -36,7 +36,7 @@ START → ocr → vlm → redact → qa → route_after_qa
                                     └─ fallback  → fallback → finalize → END
 ```
 
-- `route_after_qa`：未开质检 → end；无报告（上游失败）→ end；passed → end；重试耗尽 → fallback；否则 retry_vlm。**每个分支都有出口**。
+- `route_after_qa`：未开质检 → end；**状态已 failed（重试轮里上游失败）→ end**；无报告 → end；passed → end；重试耗尽 → fallback；否则 retry_vlm。**每个分支都有出口**（见踩坑 #16）。
 - `finalize`：开启方向矫正时，把脱敏图逆旋转回原方向（见 3.5）。
 - `recursion_limit = 3*(max_retries+1)+6`，由 `compute_recursion_limit()` 计算，**禁止硬编码省略**。
 
@@ -46,9 +46,9 @@ START → ocr → vlm → redact → qa → route_after_qa
 |---|---|---|
 | OCR（RapidOCR） | 文字块、四边形坐标、行方向角 | 不做敏感判断 |
 | 规则通道（正则） | 身份证号/手机号的确定性兜底（固话已按需求移除，见坑 #12） | 不判姓名/社保号/地址 |
-| VLM | 语义判断：哪些块敏感（输出 JSON） | **不产坐标、不生成脱敏图** |
+| VLM | 语义判断：哪些块敏感（输出 JSON） | **不产坐标、不生成脱敏图、不选脱敏方式**（方式由 `DEFAULT_METHOD`/`--method` 统一决定） |
 | 假数据映射器 | 确定性等长假值（纯函数） | 不依赖 VLM、不查表 |
-| 脱敏工具（PIL） | 白底覆盖 + 假数据重绘 + QR 打码 | 不修改 OCR 坐标 |
+| 脱敏工具（PIL） | 白底覆盖 + 假数据重绘 | 不修改 OCR 坐标；不做二维码检测/打码 |
 | 质检 | 确定性预检 + VLM 语义质检 | 不无限回退 |
 
 **坐标来源永远是 OCR**：VLM 输出 `bbox` 但 sanitize 时与 OCR 坐标做 IoU 校验（<0.3 视为幻觉，以 OCR 为准）；`points`/`angle` 一律从 OCR 拷贝。
@@ -79,6 +79,7 @@ START → ocr → vlm → redact → qa → route_after_qa
 - 回退判断（QA 未通过）：输入追加**质检意见 + 当前 mask 图（第二张图）**。
 - QA 质检（`qa_verify`）：输入原图 + mask 图 + OCR JSON + 敏感块 JSON + **各块已替换的假数据（绘制文本，必须传 `redaction_result`，见坑 #13）** + 本地预检结果 + 历史意见 → `QaVerdict`。
 - 关闭 Qwen3 思考模式：`extra_body={"chat_template_kwargs": {"enable_thinking": False}}`（不关则结构化输出不稳定）。
+- **思考模式覆盖两条调用路径**：敏感判断与语义质检共用同一个模型实例、同一份 extra_body，不存在"一条关一条没关"。服务端不接受当前写法时自动换下一种候选写法（共 3 种：`chat_template_kwargs` / 顶层 `enable_thinking` / `thinking.type`），全部被拒才放弃并打 ERROR；瞬时错误（超时/限流/5xx）不触发换写法，避免一次网络抖动就静默开着思考跑完整批。部署后核对：`grep "思考模式" logs/run_*.log` 应出现 `已关闭（extra_body=...）`。
 - `VLM_MAX_TOKENS=4096`：26 块的结构化 JSON 会超 2048，**不要调小**。
 
 ### 3.3 质检（`src/tools/qa_tool.py`，两层）
@@ -89,12 +90,25 @@ START → ocr → vlm → redact → qa → route_after_qa
    - 误伤判定 = 非敏感块**中心点**是否被遮罩多边形覆盖（不用外接矩形重叠比，竖排会误报）。
 2. **VLM 语义质检**：抓确定性通道查不了的语义漏判（如漏掉的姓名），输出 `QaVerdict` 含 `revised_block_ids` 供回退修正。
 
+**为什么质检要再跑一次 OCR，不能复用首轮结果**：首轮 OCR 描述的是**脱敏前**的原图，质检要回答的是「**输出图**里的敏感信息还在不在」——这是两张不同的图。复用首轮结果只能证明"我们画了框"，证明不了"字没了"。只有重 OCR 才能发现的失效模式：
+
+- 遮罩框偏移/偏小（OCR bbox 误差、四边形顶点异常）导致原值仍在框外可读；
+- blur/mosaic 强度不足，原文字仍可辨认；
+- 假数据重绘字号过大出框，压住相邻的非敏感文字（配合几何误伤检查）；
+- 首轮 OCR 自己漏识别的文字（首轮没读到 ≠ 不存在）。
+
+误伤检查用的是**首轮** OCR 的 bbox + 遮罩几何，本来就不需要重 OCR；重 OCR 只服务于「残留 + 正则兜底」两项。想省这 ~1.4s 的正确方向是「只重识别遮罩区域」而不是「复用首轮结果」——前者仍然在读输出图。另外这 ~1.4s 现在已被 `QA_PRECHECK_BACKGROUND` 藏进 VLM 调用里，不再计入单张耗时（见 3.8）。
+
 ### 3.4 批量与断点续传（`src/batch.py`）
 
 - case = 输入文件夹的直接子目录；图片发现用 `glob(**/*, recursive=True)`；
 - 输出**完全镜像**输入相对路径与文件名，仅顶层目录加 `_masked`（`folder1 → folder1_masked`）；
 - 启动时先扫出图片总数并打印 `共发现 N 张图片`，随后用 **tqdm 进度条**展示实时进度（跳过的图也计数，保证走得满）；进度条只在 TTY 下显示，`nohup`/重定向到文件时自动关闭，避免刷日志；
 - 断点：每处理完一张图立即原子写 `batch_progress.json`（临时文件 + `os.replace`），passed 的图重启后跳过，failed/max_retry 重试；`--no-resume` 强制全量；
+- **续跑会校验产物**：进度记录 passed 但输出文件已不存在（被删/移走）时重新处理，不会静默跳过——避免"报告说成功、目录里没文件"；
+- **输出目录不允许落在输入目录内**（`--output` 指到里面直接报错）：否则脱敏结果会写回原图位置，违反"原图必须保留"，下次运行还会把输出目录当成新 case 扫进去；
+- **Ctrl+C 只取消排队中的 case**：并行模式下中断不会把剩余 case 全跑完（那要等几小时），在跑的那几个（≤ `--workers`）收尾后退出，进度不丢；
+- 图结束状态只认 `passed/failed/max_retry`，出现中间态一律按 `failed` 记（防止"卡住"被算成成功）；
 - 并行粒度是 **case**（case 内图片串行），避免打爆 VLM API；进度写盘有 `threading.Lock` 保护；
 - 汇总报告 `batch_report.json`（含每图状态/输出/QA 结论/耗时）。
 
@@ -115,6 +129,44 @@ START → ocr → vlm → redact → qa → route_after_qa
 - 缩小策略：按 `0.85` 逐轮缩放 + 重编码，直到体积达标或长边触到 `MIN_LONG_SIDE=800`（再缩会明显掉 OCR 识别率），最多 8 轮；
 - 降级：无法解码 / 重编码失败 / 结果反而更大时**一律返回原始字节**并告警，预处理不能成为新的故障点；
 - 开关：`--max-image-mb <MB>` 调阈值（`0` 或负数 = 关闭），`--no-shrink` 直接关闭；命中缩小的张数计入报告 `statistics.shrunk_images` 与每图 `shrunk` 字段。
+
+### 3.7 EXIF 方向归一化（`src/image_preprocess.normalize_exif_orientation`）
+
+- 手机拍的票据常带 `Orientation=6/8`（像素横向存储、靠 EXIF 竖显）。后续节点只读像素，输出图又不带 EXIF，不处理就会「原图竖着看、脱敏图横着躺」，OCR 在侧倒页面上也会掉识别率；
+- 入口在缩小之前统一 `exif_transpose` 转正（只解析文件头判断，Orientation=1 时**原字节不变**，不重编码）；
+- 与 3.5 的全局方向矫正互补：EXIF 是元数据级的 90° 修正，RapidOrientation 处理「拍歪但没写 EXIF」的情况。
+
+### 3.8 单张耗时构成与调优入口
+
+本地实测（900×560 票据，20 核 CPU，RapidOCR；VLM 两项为 27B vLLM 估值）：
+
+| 阶段 | 耗时 | 说明 |
+|---|---|---|
+| OCR 首轮 | ~1.4s | 检测在固定 736 长边下进行，**与输入分辨率基本无关** |
+| VLM 敏感判断 | 2~4s | 1 张图 + OCR JSON → 结构化 JSON |
+| 脱敏 | <10ms | PIL |
+| 质检重 OCR | ~1.4s | 只做文字比对，已跳过方向检测 + 按 `QA_REOCR_MAX_SIDE` 缩小 |
+| VLM 质检 | 3~6s | 原图 + 脱敏图 + JSON → 结论 |
+
+结论：**两次 VLM 调用占 ~70%，两轮 OCR 占 ~25%**。
+
+**已实现的并发优化（`QA_PRECHECK_BACKGROUND=true`，默认开）**：确定性预检（重 OCR + 正则 + 几何误伤）放后台线程，与 VLM 语义质检同时跑——两者互不依赖，于是「先重 OCR 再调 VLM」的整段串行时间被藏进 VLM 调用里。实测 `verify` 从 `重OCR + VLM` 变为 `max(重OCR, VLM)`，**单张省 ~1.2~1.5s**。代价：VLM 不再带 `deterministic_hints`（那只是"供参考"上下文）；确定性结论仍然权威——发现硬残留就直接判 failed，无论 VLM 说什么。设 `false` 回到旧的「串行 + 带 hints」行为。
+
+**实测无效、已避开的弯路**：
+- 并发 OCR（多引擎实例）：20 核 CPU 上 4 张图并发，1 实例 5.7s / 2 实例 7.0s / 4 实例 12~14.5s。onnxruntime 单会话已吃满全部核心，多会话互相争抢，加上 PIL/numpy 预处理受 GIL 串行化。`OCR_ENGINE_INSTANCES` 默认 1（等价于旧的全局锁），只有限制每会话线程数或换 GPU 推理时调大才有意义。
+- 多进程：同理，CPU 已饱和，拆进程不会变快，只会让断点续传/进度条复杂化。
+- asyncio：单张图内各阶段是严格数据依赖（OCR→VLM→脱敏→质检），没有可并发的东西；跨图的 I/O 重叠已由 case 级线程池承担，事件循环不会额外增加并发度。
+
+**剩下的调优优先级**：
+
+1. **先确认思考模式真的关掉了**：日志出现 `带 extra_body 的调用失败…降级去掉 extra_body` 说明 vLLM 不接受 `chat_template_kwargs`，Qwen3 会输出大量推理 token，两次调用各慢数秒。升级 vLLM 或改用其支持的关闭方式。
+2. `VLM_QA_MASK_IMAGE_SIDE=512`（默认）：质检只需判断遮敏位置与文字是否消失，vision token 约为 1024 的 1/4。
+3. `VLM_MAX_IMAGE_SIDE` 1024→768：两张图 token 都降 ~44%；先用几张真实票据对比 QA 通过率再定。
+4. `QA_REOCR_MAX_SIDE=1280`：重 OCR 先缩小，实测省 ~0.2s/张。
+5. 跑批 `--workers` 建议 3~4：OCR 阶段 CPU 已饱和（串行），再加并发只会让 vLLM 排队、单张更慢。
+6. 想大幅提速只能减 VLM 调用次数（每张固定 2 次）。质检的确定性层零成本且必跑；VLM 语义质检抓的是确定性通道查不到的漏判（如漏掉的姓名），**不建议默认关闭**。
+
+---
 
 ## 4. 数据契约
 
@@ -150,7 +202,7 @@ src/
 ├── schemas/             5 个 Pydantic 模型
 ├── tools/               4 个工具 + 懒加载单例门面（tests 可向 _cache 注入假工具）
 └── nodes/               6 个节点 + common.py（fail/already_failed/require 辅助）
-tests/                   130 个单测 + conftest（隔离 .env）+ e2e_local/remote
+tests/                   167 个单测 + conftest（隔离 .env）+ e2e_local/remote
 ```
 
 **常见扩展点**：
@@ -196,7 +248,9 @@ tests/                   130 个单测 + conftest（隔离 .env）+ e2e_local/re
 12. **规则通道只收格式唯一性强的类型**（真实票据教训）：固定电话正则 `0\d{2,3}-?\d{7,8}` 与票据号码/流水号同构（票据号 `0137126549` 被误判为固话并替换）。固定电话经需求确认**不脱敏**，正则已移除；规则通道现只留身份证、手机号。新增规则类型前先问：这个格式会不会被非敏感数字串撞到？
 13. **VLM 质检必须知道假数据的存在**（真实票据教训）：QA 输入若只给"哪些块敏感"而不给"这些块已替换成什么"，VLM 看到 mask 图里的假数据文字会误判"仍清晰可见"，导致无谓重试直至 max_retry。`qa_verify` 的 `redaction_result` 参数必须传，QA prompt 中已明确"看到假数据是预期的，不算残留"。
 14. **vLLM 的 extra_body 兼容性**（部署教训）：`chat_template_kwargs`（关闭思考模式）不被旧版 vLLM 接受时会直接 400，导致整个跑批全灭。`VlmTool` 已内置自动降级：带 extra_body 调用失败 → 去掉重试一次（日志 warning）。`tests/e2e_local.py` 等测试替身同步 `qa_verify`/`analyze` 签名时勿漏 `redaction_result`。
-15. **输出扩展名必须与内容格式一致**（部署教训）：`.jpg` 输出早前直接写 PNG 字节（文件头是 PNG），下游按扩展名处理的工具会出问题。`RedactionTool._save` 与 `finalize_node` 现按目标扩展名转存 JPEG（quality=95）。
+15. **输出扩展名必须与内容格式一致**（部署教训）：`.jpg` 输出早前直接写 PNG 字节（文件头是 PNG），下游按扩展名处理的工具会出问题。`RedactionTool._save` 与 `finalize_node` 现统一走 `format_for_suffix` + `encode_image`（JPEG/WEBP/BMP/TIFF/PNG 全覆盖），新增扩展名只改那张表。
+16. **重试轮里上游失败会空转**：`qa_node` 在 `status=="failed"` 时短路返回 `{}`，`qa_report` 仍是上一轮的 `failed`。`route_after_qa` 只看报告会判 `retry_vlm`，而 vlm/redact/qa 全部短路后路由不变 → 空转至 `recursion_limit`，报 `GraphRecursionError` 并掩盖真实错误。路由第一件事必须判 `status=="failed"`。
+17. **`--method` 曾经对 VLM 块无效**：只有规则通道读 `DEFAULT_METHOD`，VLM 块永远用 prompt 里写死的 `white_mask`，`--method blur` 只影响身份证/手机号块。现由 `vlm_node` 统一覆盖 `SensitiveBlock.method`（`resolve_default_method()` 负责非法值回退），**VLM 只判断“哪些块敏感”，不决定“怎么脱”**。
 
 ---
 
@@ -246,10 +300,15 @@ python main.py --make-sample
 ## 9. 测试与验证入口
 
 ```bash
-python -m pytest tests/ -q                 # 130 个单测（无需 VLM/网络，秒级）
+python -m pytest tests/ -q                 # 167 个单测（无需 VLM/网络，秒级）；
+                                           # 未装 rapid-orientation 时 2 个方向测试 skip
 python tests/e2e_local.py                  # 本地全链路（启发式假 VLM + 真实 OCR/脱敏/质检）
-python tests/e2e_remote.py                 # 真实 VLM 全链路（需 .env 配好 API Key）
+python tests/e2e_remote.py                 # 真实 VLM 全链路（需 .env 配好 API Key，会消耗配额）
 ```
+
+`requirements.txt` 锁死全部确切版本（= 上述测试跑通的那套环境，Python 3.11）。
+注意 `rapidocr` 自己不依赖 `onnxruntime`（它的推理引擎），`requirements.txt`
+里显式锁了——漏掉它全新环境会在第一张图报 `ModuleNotFoundError`。
 
 测试文件职责：`test_graph`（流程/路由/失败传播）、`test_tools`（脱敏像素/质检判定/假数据不误报）、`test_fake_data`（映射确定性/等长/合法性）、`test_batch`（glob/镜像/断点/并行/大图缩小）、`test_preprocess`（缩小阈值/等比/格式一致/降级）、`test_rotation`（四边形角度/误伤）、`test_orientation`（转正坐标系/finalize 往返/方向语义，夹具图用 `make_sample` 在 tmp 目录自生成，不依赖 data/）。`fakes.py` 提供全套测试替身；新工具签名变化时先同步 fakes。
 
@@ -279,4 +338,4 @@ python tests/e2e_remote.py                 # 真实 VLM 全链路（需 .env 配
 - QA 能正确处理“假数据已在图中”与“标签保留”策略，无误判重试。
 
 **已知限制**：
-- 实拍票据的二维码常因透视变形检测不到（OpenCV `QRCodeDetector` 限制），未打码；QR 内容通常为票据号/查验 URL，按当前规则均不脱敏，风险低。如需打码需更换鲁棒的 QR 检测库或由 VLM 圈定二维码区域。
+- **不做二维码/条码检测与打码**（按需求移除）：QR 内容通常是票据号/查验 URL，按当前 5 类脱敏范围均不脱敏；OpenCV 检测在实拍票据上耗时且常因透视变形漏检，性价比低。若将来需要打码，应由 VLM 圈定区域或换鲁棒检测库，不要恢复旧的 `QRCodeDetector` 路径。

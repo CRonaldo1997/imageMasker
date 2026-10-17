@@ -186,6 +186,85 @@ def test_route_after_qa_branches():
     failed = QaReport(status="failed", reason="residual", feedback="fix b0")
     assert route_after_qa(dict(base, qa_report=failed, retry_count=0)) == "retry_vlm"
     assert route_after_qa(dict(base, qa_report=failed, retry_count=3)) == "fallback"
+    # 重试轮里上游失败：qa_report 还是上一轮的 failed，但必须直接结束
+    assert (
+        route_after_qa(dict(base, status="failed", qa_report=failed, retry_count=0))
+        == "end"
+    )
+
+
+def test_upstream_failure_on_retry_terminates():
+    """重试轮里 VLM 失败必须立刻结束。
+
+    历史 bug：qa_node 短路返回 {} 后 qa_report 仍是上一轮的 failed，
+    route_after_qa 会继续判 retry_vlm → vlm/redact/qa 全部短路 → 空转，
+    直到撞 recursion_limit 抛 GraphRecursionError（错误信息还掩盖了真因）。
+    """
+
+    class FailOnRetryVlm(FakeVlmTool):
+        def analyze(self, image, ocr_result, previous_redaction=None, feedback=None):
+            self.calls += 1
+            self.feedbacks.append(feedback)
+            if feedback is not None:
+                raise TimeoutError("vlm timeout on retry")
+            return super().analyze(image, ocr_result, previous_redaction, feedback)
+
+    inject(
+        ocr=FakeOcrTool(),
+        vlm=FailOnRetryVlm(),
+        redact=FakeRedactionTool(),
+        qa=FakeQaTool(fail_times=1),
+    )
+    result = build_graph().invoke(
+        initial_state(max_retries=3),
+        config={"recursion_limit": compute_recursion_limit(3)},
+    )
+
+    assert result["status"] == "failed"
+    assert "vlm timeout on retry" in result["error"]
+
+
+def test_default_method_applies_to_vlm_blocks(monkeypatch):
+    """--method / DEFAULT_METHOD 必须对 VLM 判断出的块同样生效。
+
+    历史 bug：只有规则通道读取配置，VLM 块永远走 prompt 写死的
+    white_mask，导致 --method blur/mosaic 对绝大多数块无效。
+    """
+    import importlib
+
+    from src.schemas.vlm_analysis import RedactionMethod
+
+    vlm_node_module = importlib.import_module("src.nodes.vlm_node")
+    monkeypatch.setattr(
+        vlm_node_module, "resolve_default_method", lambda: RedactionMethod.BLUR
+    )
+    inject(
+        ocr=FakeOcrTool(),
+        vlm=FakeVlmTool(),
+        redact=FakeRedactionTool(),
+        qa=FakeQaTool(),
+    )
+    result = build_graph().invoke(initial_state(), config={"recursion_limit": 20})
+
+    blocks = result["vlm_analysis"].sensitive_blocks
+    assert blocks
+    assert {sb.method for sb in blocks} == {RedactionMethod.BLUR}
+
+
+def test_invalid_default_method_falls_back(monkeypatch):
+    """DEFAULT_METHOD 写错不应让节点抛 ValueError，而是回退 white_mask。"""
+    import src.config as config_module
+    from src.schemas.vlm_analysis import RedactionMethod
+
+    monkeypatch.setattr(
+        config_module, "get_settings", lambda: Settings(default_method="blurr")
+    )
+    assert config_module.resolve_default_method() is RedactionMethod.WHITE_MASK
+
+    monkeypatch.setattr(
+        config_module, "get_settings", lambda: Settings(default_method="Mosaic")
+    )
+    assert config_module.resolve_default_method() is RedactionMethod.MOSAIC
 
 
 def test_fallback_node_message():
@@ -212,7 +291,7 @@ def test_make_ocr_result_shape():
 
 
 def test_vlm_extra_body_degradation(tmp_path):
-    """extra_body 不被服务端接受时（如 vLLM 版本不兼容），自动去掉重试。"""
+    """extra_body 不被服务端接受时自动换下一种关闭思考的写法（不静默开思考）。"""
     from src.config import Settings
     from src.schemas.ocr_result import OcrResult, OcrTextBlock
     from src.tools.vlm_tool import VlmTool
@@ -244,11 +323,110 @@ def test_vlm_extra_body_degradation(tmp_path):
         image=_png_bytes(tmp_path),
         ocr_result=OcrResult(engine="stub", blocks=[OcrTextBlock(block_id="b0", text="姓名：张三")]),
     )
-    assert calls["n"] == 2  # 第一次带 extra_body 失败，第二次去掉后成功
-    assert tool._extra_body == {}  # 已降级
-    assert tool._extra_body_disabled is True
+    assert calls["n"] == 2  # 第一次带 extra_body 失败，第二种写法成功后通过
+    # 换成了下一种候选写法，而不是直接放弃关闭思考
+    assert tool._extra_body == {"enable_thinking": False}
+    assert tool._extra_body_disabled is False
+    assert tool._payload_candidates == [{"thinking": {"type": "disabled"}}]
     # analyze 会用配置的模型名覆写（符合代码逻辑）
     assert result.model == settings.vlm_model
+
+
+def test_vlm_transient_error_keeps_thinking_off_payload(tmp_path):
+    """超时/限流/5xx 等瞬时错误不能换掉关闭思考的参数写法。
+
+    否则一次网络抖动就把候选耗尽，之后整批都开着思考跑——又慢又不稳。
+    """
+    from src.config import Settings
+    from src.tools.vlm_tool import VlmTool
+
+    tool = VlmTool(Settings(output_dir=str(tmp_path), vlm_enable_thinking=False))
+    original = dict(tool._extra_body)
+
+    for exc in (
+        TimeoutError("read timeout"),
+        RuntimeError("503 service unavailable"),
+        RuntimeError("429 rate limit exceeded"),
+        ConnectionError("connection reset by peer"),
+    ):
+        tool._degrade_extra_body(exc)
+
+    assert tool._extra_body == original          # 参数原样保留
+    assert len(tool._payload_candidates) == 3    # 候选一个没少
+
+    # 真正的参数被拒才会换写法
+    tool._degrade_extra_body(RuntimeError("400: unexpected keyword chat_template_kwargs"))
+    assert tool._extra_body != original
+
+
+def test_vlm_thinking_off_gives_up_only_after_all_candidates(tmp_path, caplog):
+    """所有关闭思考的写法都被拒：必须放弃并打 ERROR，不能静默开思考。"""
+    import logging
+
+    from src.config import Settings
+    from src.schemas.ocr_result import OcrResult, OcrTextBlock
+    from src.tools.vlm_tool import VlmTool
+
+    tool = VlmTool(Settings(output_dir=str(tmp_path), vlm_enable_thinking=False))
+
+    class AlwaysReject:
+        def invoke(self, messages):
+            raise RuntimeError("400: unexpected keyword")
+
+    class FakeModel:
+        def with_structured_output(self, schema, method=None):
+            return AlwaysReject()
+
+        def invoke(self, messages):
+            raise RuntimeError("400: unexpected keyword")
+
+    tool._build_model = lambda: FakeModel()
+    tool._model = FakeModel()
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(Exception):
+            tool.analyze(
+                image=_png_bytes(tmp_path),
+                ocr_result=OcrResult(
+                    engine="stub", blocks=[OcrTextBlock(block_id="b0", text="姓名：张三")]
+                ),
+            )
+
+    assert tool._extra_body == {}          # 已放弃下发
+    assert tool._extra_body_disabled is True
+    assert tool._payload_candidates == []  # 候选全部用完
+    # 必须留下明确 ERROR，部署时 grep 得到
+    assert any("思考模式" in r.message for r in caplog.records)
+
+
+def test_vlm_thinking_off_state_logged_once(tmp_path, caplog):
+    """首次调用前把思考模式的实际状态打出来（部署后核对用）。"""
+    import logging
+
+    from src.config import Settings
+    from src.schemas.ocr_result import OcrResult, OcrTextBlock
+    from src.tools.vlm_tool import VlmTool
+
+    tool = VlmTool(Settings(output_dir=str(tmp_path), vlm_enable_thinking=False))
+    ocr = OcrResult(engine="stub", blocks=[OcrTextBlock(block_id="b0", text="姓名：张三")])
+
+    class FakeStructured:
+        def invoke(self, messages):
+            from src.schemas.vlm_analysis import VlmAnalysis
+
+            return VlmAnalysis(sensitive_blocks=[], model="fake")
+
+    class FakeModel:
+        def with_structured_output(self, schema, method=None):
+            return FakeStructured()
+
+    tool._model = FakeModel()
+    with caplog.at_level(logging.INFO):
+        tool.analyze(image=_png_bytes(tmp_path), ocr_result=ocr)
+        tool.analyze(image=_png_bytes(tmp_path), ocr_result=ocr)
+
+    lines = [r.message for r in caplog.records if "思考模式" in r.message]
+    assert len(lines) == 1 and "已关闭" in lines[0]
 
 
 def test_vlm_extra_body_not_disabled_when_thinking_on(tmp_path):

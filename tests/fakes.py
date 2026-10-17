@@ -158,8 +158,12 @@ class StubOcrEngine:
 
     def __init__(self, texts: List[str]):
         self.texts = texts
+        self.kwargs: dict = {}
+        self.last_image_bytes: Optional[bytes] = None
 
-    def extract(self, image_bytes=None, image_path=None) -> OcrResult:
+    def extract(self, image_bytes=None, image_path=None, **kwargs) -> OcrResult:
+        self.kwargs = kwargs
+        self.last_image_bytes = image_bytes
         return OcrResult(
             engine="stub",
             width=400,

@@ -13,6 +13,10 @@
    都基于缩小后的同一份字节，坐标天然自洽，不需要坐标反变换；
 4. 任何异常（文件损坏、格式不支持、编码失败）一律返回原始字节并告警，
    预处理不能成为新的故障点。
+
+入口还有一步 EXIF 方向归一化（normalize_exif_orientation）：
+手机拍摄的票据带 Orientation 标记时先转正像素，否则输出图会横躺、
+OCR 也会在侧倒页面上掉识别率。仅在 Orientation != 1 时才重编码。
 """
 from __future__ import annotations
 
@@ -20,7 +24,7 @@ import logging
 from io import BytesIO
 from typing import Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +121,56 @@ def maybe_shrink(
     return data, info
 
 
+def normalize_exif_orientation(image_bytes: bytes) -> Tuple[bytes, Optional[dict]]:
+    """按 EXIF Orientation 把像素转正，返回 (新字节, 处理信息)。
+
+    为什么需要：手机拍摄的票据常带 Orientation=6/8（像素横向存储、
+    靠 EXIF 标记竖显）。后续所有节点（OCR/VLM/脱敏）都读原始像素，而
+    输出图在重新编码时不含 EXIF，结果就是「原图竖着看、脱敏图横着躺」，
+    OCR 在侧倒的页面上识别率也会明显下降。
+
+    入口统一转正后：坐标、脱敏图、输出方向全部自洽，EXIF 也不再需要。
+
+    降级（与 maybe_shrink 一致）：无 EXIF / Orientation=1 / 解码失败 /
+    重编码失败时一律返回原字节，预处理不做新的故障点。
+    """
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            # 读 EXIF 只需解析文件头，未触发整图解码，开销可忽略
+            orientation = int(img.getexif().get(_EXIF_ORIENTATION_TAG, 1) or 1)
+            if orientation in (0, 1):
+                return image_bytes, None
+            fmt = (img.format or "PNG").upper()
+            orig_size = img.size
+            upright = ImageOps.exif_transpose(img)
+            if upright is None:  # 极端情况下拿不到转正结果，保持原样
+                return image_bytes, None
+            work = _to_rgb(upright)
+            data = _encode(work, fmt, quality=95)
+    except UnidentifiedImageError:
+        # 不是图片（损坏/黑客文件）：主流程 OCR 会给出明确错误，这里不重复告警
+        logger.debug("内容不是可解码图片，跳过 EXIF 方向矫正")
+        return image_bytes, None
+    except Exception as exc:
+        logger.warning(
+            "EXIF 方向矫正跳过（%s: %s），按原始像素处理",
+            type(exc).__name__, exc,
+        )
+        return image_bytes, None
+
+    info = {
+        "orientation": orientation,
+        "original_size": list(orig_size),
+        "rotated_size": list(work.size),
+        "format": fmt,
+    }
+    logger.info(
+        "EXIF 方向矫正：Orientation=%d，%dx%d → %dx%d（%s）",
+        orientation, orig_size[0], orig_size[1], work.size[0], work.size[1], fmt,
+    )
+    return data, info
+
+
 def _to_rgb(img: Image.Image) -> Image.Image:
     """统一转 RGB；带透明通道的图合成到白底，避免透明区变黑。"""
     if img.mode == "RGB":
@@ -129,13 +183,13 @@ def _to_rgb(img: Image.Image) -> Image.Image:
     return img.convert("RGB")
 
 
-def _encode(img: Image.Image, fmt: str) -> bytes:
+def _encode(img: Image.Image, fmt: str, quality: int = JPEG_QUALITY) -> bytes:
     """按原格式重编码，保证输出扩展名与内容一致。"""
     buf = BytesIO()
     if fmt == "JPEG":
-        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
     elif fmt == "WEBP":
-        img.save(buf, format="WEBP", quality=JPEG_QUALITY)
+        img.save(buf, format="WEBP", quality=quality)
     else:
         img.save(buf, format=fmt, optimize=True)
     return buf.getvalue()

@@ -7,8 +7,8 @@
 - blur / mosaic：直接模糊/马赛克，不重绘（模糊区写宇无意义）。
 
 坐标一律使用 OCR/VLM 传入的 bbox，不做修改。
-QR 码 / 条码检测：票据二维码常编码患者 ID 或带 token 的 URL，
-是 OCR 文字通道之外的泄露面，脱敏前先检测并打码。
+不做二维码/条码检测与打码（已按需求移除：QR 内容通常为票据号/查验 URL，
+按当前脱敏范围不属于敏感信息，且检测在实拍票据上耗时且常误检）。
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import logging
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -37,6 +37,49 @@ _FONT_CANDIDATES = (
 )
 
 _BASE_FONT_SIZE = 48  # 基准字号，按 bbox 高度比例缩放
+
+#: 扩展名 → PIL 编码格式。未知扩展名一律按 PNG 落盘。
+_FORMAT_BY_SUFFIX: Dict[str, str] = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".bmp": "BMP",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+}
+
+#: 无损/有损格式的重编码质量（JPEG/WEBP 生效）
+_OUTPUT_QUALITY = 95
+
+
+def format_for_suffix(suffix: str) -> str:
+    """输出扩展名决定编码格式，保证「扩展名与内容格式一致」。"""
+    return _FORMAT_BY_SUFFIX.get((suffix or "").lower(), "PNG")
+
+
+def encode_image(img: "Image.Image", fmt: str) -> bytes:
+    """按目标格式编码图片字节。
+
+    历史实现只区分 .jpg 与「其它」：.tif/.bmp/.webp 会把 PNG 字节写进
+    .tif 等文件，下游按扩展名处理时出现「文件头不是该格式」的问题
+    （同踩坑 #15 的 .jpg 版本，只是输入扩展名更多）。
+    """
+    buf = BytesIO()
+    fmt = (fmt or "PNG").upper()
+    if fmt == "JPEG":
+        img.convert("RGB").save(
+            buf, format="JPEG", quality=_OUTPUT_QUALITY, optimize=True
+        )
+    elif fmt == "WEBP":
+        img.save(buf, format="WEBP", quality=_OUTPUT_QUALITY)
+    elif fmt == "TIFF":
+        img.save(buf, format="TIFF", compression="tiff_deflate")
+    elif fmt == "BMP":
+        img.save(buf, format="BMP")
+    else:
+        img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 class RedactionTool:
@@ -81,19 +124,13 @@ class RedactionTool:
                 )
             )
 
-        if self._settings.detect_qr_codes:
-            for bbox, points in self._detect_qr_codes(img):
-                targets.append(
-                    (bbox, RedactionMethod.WHITE_MASK.value, "qr", "", "qr", points, 0.0)
-                )
-
         for bbox, method, block_id, draw_text, source, points, angle in targets:
             self._apply_one(img, bbox, method, draw_text, points, angle)
 
         records = [
             RedactedBlock(
                 block_id=block_id,
-                text=draw_text if draw_text else ("<二维码/条码>" if block_id == "qr" else ""),
+                text=draw_text or "",
                 bbox=bbox,
                 points=points,
                 angle=angle,
@@ -246,38 +283,6 @@ class RedactionTool:
             self._font_cache[size] = cached
         return cached
 
-    # ------------------------------------------------------------------ QR
-
-    def _detect_qr_codes(self, img: Image.Image) -> List[Tuple[List[int], List[List[int]]]]:
-        """返回 [(外接矩形, 四边形顶点)]。"""
-        try:
-            import cv2
-            import numpy as np
-
-            arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            detector = cv2.QRCodeDetector()
-            quads: List[Sequence] = []
-            try:
-                ok, points = detector.detectMulti(arr)
-                if ok and points is not None:
-                    quads = list(points)
-            except Exception:  # 单码检测兜底
-                _, points, _ = detector.detectAndDecode(arr)
-                if points is not None and len(points) > 0:
-                    quads = [points]
-            results = []
-            for quad in quads:
-                pts = [[round(float(p[0])), round(float(p[1]))] for p in quad]
-                xs = [p[0] for p in pts]
-                ys = [p[1] for p in pts]
-                results.append(([min(xs), min(ys), max(xs), max(ys)], pts))
-            if results:
-                logger.info("检测到 %d 个二维码/条码，将一并打码", len(results))
-            return results
-        except Exception as exc:
-            logger.warning("QR 检测失败，跳过：%s", exc)
-            return []
-
     # ------------------------------------------------------------------ 其他
 
     def _padded(self, bbox: List[int], size: Tuple[int, int]) -> Tuple[int, int, int, int]:
@@ -291,19 +296,17 @@ class RedactionTool:
     def _save(self, data: bytes, output_path: Optional[str] = None) -> Tuple[Path, bytes]:
         """保存脱敏图，返回 (路径, 最终字节)。
 
-        目标扩展名是 .jpg/.jpeg 时转存 JPEG（内容格式与扩展名一致），
-        其余按 PNG。无 output_path 时用 output_dir + 时间戳（PNG）。
+        编码格式按目标扩展名决定（.jpg→JPEG、.tif→TIFF、.webp→WEBP …），
+        保证内容与扩展名一致；无 output_path 时用 output_dir + 时间戳（PNG）。
         """
         if output_path:
             path = Path(output_path)
             if not path.is_absolute():
                 path = PROJECT_ROOT / path
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.suffix.lower() in (".jpg", ".jpeg"):
-                img = Image.open(BytesIO(data)).convert("RGB")
-                buf = BytesIO()
-                img.save(buf, format="JPEG", quality=95)
-                data = buf.getvalue()
+            fmt = format_for_suffix(path.suffix)
+            if fmt != "PNG":  # PNG 与 redacted_image 的默认编码一致，无需重编码
+                data = encode_image(Image.open(BytesIO(data)), fmt)
             path.write_bytes(data)
             return path, data
         out_dir = Path(self._settings.output_dir)

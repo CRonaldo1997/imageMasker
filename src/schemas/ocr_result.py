@@ -32,8 +32,10 @@ class OcrResult(BaseModel):
     """OCR 工具输出。
 
     开启方向矫正时，blocks/width/height 均为**转正图坐标系**：
-    rotation 记录原图需顺时针旋转的度数，aligned_image 是转正图
-    字节（供下游节点替换原图使用，最后统一逆旋转回原方向）。
+    rotation 记录原图需**逆时针**旋转的度数（0/90/180/270），
+    aligned_image 是转正图字节（供下游节点替换原图使用，
+    最后由 finalize 节点统一逆旋转回原方向）。语义见
+    docs/ubuntu-runbook.md 与 tests/test_orientation.py。
     """
 
     engine: str = Field(description="OCR 引擎名称")
@@ -41,7 +43,9 @@ class OcrResult(BaseModel):
     height: int = 0
     blocks: List[OcrTextBlock] = Field(default_factory=list)
     image_path: Optional[str] = None
-    rotation: int = Field(default=0, description="原图需顺时针旋转的度数（0/90/180/270）")
+    rotation: int = Field(
+        default=0, description="原图需逆时针旋转的度数（0/90/180/270）"
+    )
     aligned_image: Optional[bytes] = Field(
         default=None, description="转正图字节（未矫正时为 None）"
     )

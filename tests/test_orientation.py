@@ -95,8 +95,8 @@ def test_alignment_uses_counterclockwise_rotation(correct_settings, tmp_path):
             return "90", 0.01
 
     tool = OcrTool(correct_settings)
-    tool._orientation_engine = MockOrientation()
-    tool._np = np
+    tool._local.orientation_engine = MockOrientation()
+    tool._local.np = np
     result = tool.extract(image_path=str(src))
 
     aligned = Image.open(BytesIO(result.aligned_image))
@@ -131,7 +131,7 @@ def test_extract_off_by_default(tmp_path, vertical_sample):
 def test_orientation_engine_failure_degrades(correct_settings, vertical_sample):
     """引擎不可用：降级原图直跑，不抛异常。"""
     tool = OcrTool(correct_settings)
-    tool._orientation_failed = True
+    tool._local.orientation_failed = True
     result = tool.extract(image_path=vertical_sample)
     assert result.rotation == 0
     assert len(result.blocks) == 23
@@ -199,3 +199,21 @@ def test_finalize_writes_output_file(tmp_path, vertical_sample):
 
     saved = Image.open(out)
     assert saved.size == original.size
+
+
+def test_finalize_output_matches_extension(tmp_path, vertical_sample):
+    """finalize 落盘也要按扩展名编码（.tif 不能写 PNG 字节）。"""
+    original = Image.open(vertical_sample).convert("RGB")
+    aligned = original.rotate(90, expand=True)
+    buf = BytesIO()
+    aligned.save(buf, format="PNG")
+
+    out = tmp_path / "masked.tif"
+    result = _redaction_result(buf.getvalue(), 900, 560)
+    result.output_path = str(out)
+    finalize_node({"rotation": 90, "redaction_result": result})
+
+    data = out.read_bytes()
+    assert data[:4] in (b"II*\x00", b"MM\x00*")
+    with Image.open(BytesIO(data)) as saved:
+        assert saved.size == original.size

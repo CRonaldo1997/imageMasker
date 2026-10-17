@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
 import threading
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from PIL import Image
 
@@ -88,42 +90,69 @@ class OcrTool:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._engine_name = settings.ocr_engine
-        self._engine = None
-        # 方向矫正引擎（懒加载，缺失时自动降级）
-        self._orientation_engine = None
-        self._orientation_failed = False
-        self._np = None
-        # 批量模式下多个 case 线程共用同一实例，OCR 推理引擎
-        # （onnxruntime 会话 + 预处理缓冲）非严格线程安全，串行化调用。
-        self._lock = threading.Lock()
+        # 引擎实例池。RapidOCR/PaddleOCR 的 Python 层有共享缓冲，不保证
+        # 线程安全，因此实例不跨线程共用；改为「按需创建、用后归还」。
+        # 默认上限 1：实测 CPU 上并发 OCR 只会更慢（onnxruntime 单会话
+        # 已吃满核心），所以默认行为与旧的全局锁完全一致；只有在给每个
+        # 会话限制线程数或换 GPU 推理时，调大 OCR_ENGINE_INSTANCES 才有收益。
+        self._pool: "queue.LifoQueue" = queue.LifoQueue()
+        self._pool_lock = threading.Lock()
+        self._created = 0
+        self._max_engines = max(1, settings.ocr_engine_instances)
+        # 方向矫正引擎：线程本地（onnx 分类器很小，按线程各持一份）
+        self._local = threading.local()
 
     # ------------------------------------------------------------------ 引擎
 
-    def _get_rapid(self):
-        if self._engine is None:
-            from rapidocr import RapidOCR
+    def _build_rapid(self):
+        from rapidocr import RapidOCR
 
-            self._engine = RapidOCR()
-        return self._engine
+        return RapidOCR()
 
-    def _get_paddle(self):
-        if self._engine is None:
-            from paddleocr import PaddleOCR
+    def _build_paddle(self):
+        from paddleocr import PaddleOCR
 
-            try:  # 3.x 参数名
-                self._engine = PaddleOCR(
-                    use_doc_orientation_classify=False,
-                    use_doc_unwrapping=False,
-                    use_textline_orientation=False,
-                )
-            except TypeError:  # 2.x 参数名
-                self._engine = PaddleOCR(use_angle_cls=False, lang="ch")
-        return self._engine
+        try:  # 3.x 参数名
+            return PaddleOCR(
+                use_doc_orientation_classify=False,
+                use_doc_unwrapping=False,
+                use_textline_orientation=False,
+            )
+        except TypeError:  # 2.x 参数名
+            return PaddleOCR(use_angle_cls=False, lang="ch")
 
-    def _run_rapid(self, image: Image.Image) -> List[Tuple[object, str, float]]:
+    def _new_engine(self):
+        return self._build_paddle() if self._engine_name == "paddle" else self._build_rapid()
+
+    @contextmanager
+    def _borrow_engine(self) -> Iterator[object]:
+        """借一个引擎实例：池里有就取，没满就新建，满了就排队等空闲。"""
+        engine = None
+        create = False
+        with self._pool_lock:
+            if not self._pool.empty():
+                engine = self._pool.get_nowait()
+            elif self._created < self._max_engines:
+                self._created += 1
+                create = True
+        if engine is None:
+            if create:
+                try:
+                    engine = self._new_engine()
+                except Exception:
+                    with self._pool_lock:
+                        self._created -= 1  # 创建失败要把名额还回去
+                    raise
+            else:
+                engine = self._pool.get()  # 达到上限：阻塞等空闲实例
+        try:
+            yield engine
+        finally:
+            self._pool.put(engine)
+
+    def _run_rapid(self, engine, image: Image.Image) -> List[Tuple[object, str, float]]:
         import numpy as np
 
-        engine = self._get_rapid()
         arr = np.array(image.convert("RGB"))
         res = engine(arr)
         return self._parse_rapidocr(res)
@@ -156,10 +185,9 @@ class OcrTool:
             out.append((box, str(text), float(score)))
         return out
 
-    def _run_paddle(self, image: Image.Image) -> List[Tuple[object, str, float]]:
+    def _run_paddle(self, engine, image: Image.Image) -> List[Tuple[object, str, float]]:
         import numpy as np
 
-        engine = self._get_paddle()
         arr = np.array(image.convert("RGB"))
         try:  # 3.x
             raw = engine.predict(arr)
@@ -202,7 +230,10 @@ class OcrTool:
     # ------------------------------------------------------------------ 对外
 
     def extract(
-        self, image_path: Optional[str] = None, image_bytes: Optional[bytes] = None
+        self,
+        image_path: Optional[str] = None,
+        image_bytes: Optional[bytes] = None,
+        detect_orientation: Optional[bool] = None,
     ) -> OcrResult:
         """识别文字块与坐标。失败时抛异常，由节点落地为失败状态。
 
@@ -211,26 +242,33 @@ class OcrTool:
         rotation 记录旋转度数、aligned_image 附带转正图字节——
         下游 OCR/VLM/脱敏/质检全部在转正图上进行，最后由 finalize
         节点统一逆旋转回原方向。未开启时行为与之前完全一致。
+
+        detect_orientation=False：显式跳过方向检测。质检重 OCR 用它——
+        脱敏图本来就在转正坐标系里，再检测一次既多花一次推理，万一同
+        一个方向分类器给出非 0° 结果，还会把重 OCR 的文本转到错误方向，
+        让残留/正则兜底静默失效。
         """
         image, source = _load_image(image_path, image_bytes)
+        if detect_orientation is None:
+            detect_orientation = self._settings.ocr_orientation_correct
 
-        # 共享引擎（RapidOCR / PaddleOCR）内部持有推理会话与可复用缓冲，
-        # 批量模式多线程并发调用可能破坏状态，这里串行化引擎交互。
-        with self._lock:
-            rotation = 0
-            ocr_image = image
-            if self._settings.ocr_orientation_correct:
-                rotation = self._detect_orientation(image)
-                if rotation:
-                    # RapidOrientation 返回值 = 需逆时针旋转的度数；
-                    # PIL rotate(正角度) 即视觉逆时针
-                    ocr_image = image.rotate(rotation, expand=True)
-                    logger.info("方向矫正：原图需逆时针旋转 %d°，已转正后识别", rotation)
+        rotation = 0
+        ocr_image = image
+        if detect_orientation:
+            rotation = self._detect_orientation(image)
+            if rotation:
+                # RapidOrientation 返回值 = 需逆时针旋转的度数；
+                # PIL rotate(正角度) 即视觉逆时针
+                ocr_image = image.rotate(rotation, expand=True)
+                logger.info("方向矫正：原图需逆时针旋转 %d°，已转正后识别", rotation)
 
+        # 每个线程借用独立的引擎实例（池上限 OCR_ENGINE_INSTANCES），
+        # 并发 OCR 不再互等；用完归还给池。
+        with self._borrow_engine() as engine:
             if self._engine_name == "paddle":
-                raw_items = self._run_paddle(ocr_image)
+                raw_items = self._run_paddle(engine, ocr_image)
             else:
-                raw_items = self._run_rapid(ocr_image)
+                raw_items = self._run_rapid(engine, ocr_image)
 
         blocks: List[OcrTextBlock] = []
         for quad, text, score in raw_items:
@@ -280,32 +318,36 @@ class OcrTool:
         特征点像素测试固化。
 
         依赖缺失或推理失败时降级为 0（原图直跑），不让可选增强变成故障点。
+        引擎与失败标记都放线程本地：并发跑批时每个线程独立持有一份，
+        互不拖累（一个线程失败不影响其他线程继续尝试）。
         """
-        if self._orientation_failed:
+        if getattr(self._local, "orientation_failed", False):
             return 0
-        if self._orientation_engine is None:
+        engine = getattr(self._local, "orientation_engine", None)
+        if engine is None:
             try:
                 import numpy as np
                 from rapid_orientation import RapidOrientation
 
-                self._orientation_engine = RapidOrientation()
-                self._np = np
+                engine = RapidOrientation()
+                self._local.orientation_engine = engine
+                self._local.np = np
             except Exception as exc:
                 logger.warning(
                     "rapid-orientation 不可用，跳过方向矫正（%s）；"
                     "安装：pip install rapid-orientation",
                     exc,
                 )
-                self._orientation_failed = True
+                self._local.orientation_failed = True
                 return 0
         try:
-            arr = self._np.array(image.convert("RGB"))
-            angle, _cost = self._orientation_engine(arr)
+            arr = self._local.np.array(image.convert("RGB"))
+            angle, _cost = engine(arr)
             # RapidOrientation 可能返回 int / float / numpy 标量，统一转角度。
             # 直接 int(str(angle)) 在 float（如 90.0）时会抛 ValueError，
             # 导致方向矫正被永久禁用（部署开启该功能时的隐患）。
             return int(round(float(angle))) % 360
         except Exception as exc:
             logger.warning("方向检测失败，跳过矫正：%s", exc)
-            self._orientation_failed = True
+            self._local.orientation_failed = True
             return 0

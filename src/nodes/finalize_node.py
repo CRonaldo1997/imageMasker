@@ -16,6 +16,7 @@ from PIL import Image
 from src.config import PROJECT_ROOT
 from src.graph_state import RedactionState
 from src.schemas.redaction_result import RedactionResult
+from src.tools.redaction_tool import encode_image, format_for_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -30,17 +31,9 @@ def finalize_node(state: RedactionState) -> RedactionState:
     # 转正是 rotate(+rotation)（逆时针），还原即逆操作 rotate(-rotation)
     restored = img.rotate(-rotation, expand=True)
 
-    # 按目标扩展名决定格式（.jpg → JPEG，内容与扩展名一致）
-    if result.output_path and Path(result.output_path).suffix.lower() in (
-        ".jpg",
-        ".jpeg",
-    ):
-        buf = BytesIO()
-        restored.save(buf, format="JPEG", quality=95)
-    else:
-        buf = BytesIO()
-        restored.save(buf, format="PNG")
-    result.redacted_image = buf.getvalue()
+    # 按目标扩展名决定格式（.jpg→JPEG、.tif→TIFF、.webp→WEBP …）
+    fmt = format_for_suffix(Path(result.output_path).suffix) if result.output_path else "PNG"
+    result.redacted_image = encode_image(restored, fmt)
     result.width, result.height = restored.size
 
     # 覆盖写回原输出路径（转正版本已被替换为原方向版本）

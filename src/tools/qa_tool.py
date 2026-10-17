@@ -10,7 +10,12 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from io import BytesIO
+from typing import Dict, List, Optional
+
+from PIL import Image
 
 from src.config import Settings
 from src.schemas.ocr_result import OcrResult
@@ -24,6 +29,21 @@ from src.tools.vlm_tool import VlmTool
 logger = logging.getLogger(__name__)
 
 _PUNCT = "，。、；：？！（）()[]【】{}<>《》“”\"'’‘-—_/|.:：,;!?~`+*#@$%^& \t\r\n"
+
+
+@dataclass
+class _Precheck:
+    """确定性预检结果（本地、零成本、无网络依赖）。"""
+
+    residual_texts: List[str] = field(default_factory=list)
+    residual_patterns: List[str] = field(default_factory=list)
+    damaged: List[str] = field(default_factory=list)
+    hints: Dict[str, object] = field(default_factory=dict)
+
+    @property
+    def hard_fail(self) -> bool:
+        """硬残留：确定性证据充分，直接判失败，不必等 VLM 结论。"""
+        return bool(self.residual_texts or self.residual_patterns)
 
 
 def normalize(text: str) -> str:
@@ -54,71 +74,85 @@ class QaTool:
         redaction_result: Optional[RedactionResult] = None,
         feedback: Optional[str] = None,
     ) -> QaReport:
-        """质检脱敏结果，输出结构化报告。"""
-        re_ocr = self._ocr.extract(image_bytes=redacted_image)
-        re_texts = [b.text for b in re_ocr.blocks]
-        drawn_texts = (
-            [rb.text for rb in redaction_result.redacted_blocks if rb.text]
-            if redaction_result
-            else []
-        )
+        """质检脱敏结果，输出结构化报告。
 
-        # ---- 第一层：确定性预检 ----
-        residual_texts = self._find_residuals(vlm_analysis, re_texts)
-        residual_patterns = self._find_patterns(re_texts, drawn_texts)
-        damaged = self._find_collateral(vlm_analysis, ocr_result, redaction_result)
-        hints = {
-            "re_ocr_blocks": re_texts,
-            "residual_block_ids": residual_texts,
-            "pattern_hits": residual_patterns,
-            "damaged_block_ids": damaged,
-        }
-
-        if residual_texts or residual_patterns:
-            # 硬残留：确定性证据充分，直接判失败
-            return self._report(
-                status="failed",
-                reason=self._build_reason(residual_texts, residual_patterns, damaged),
-                feedback=self._build_feedback(residual_texts, residual_patterns, damaged),
-                residual_texts=residual_texts,
-                residual_patterns=residual_patterns,
-                damaged_texts=damaged,
-                details=hints,
+        默认把**确定性预检**（重 OCR + 正则 + 几何误伤）放到后台线程，
+        与 VLM 语义质检同时跑：两者互不依赖，这样「先重 OCR 再调 VLM」
+        的整段串行时间（实测 ~1.4s/张）被藏进 VLM 调用里。
+        代价是 VLM 不再带 deterministic_hints（那只是"供参考"上下文）；
+        确定性结论仍然权威——只要预检发现硬残留，无论 VLM 说什么都判 failed。
+        `QA_PRECHECK_BACKGROUND=false` 可回到旧的「串行 + 带 hints」行为。
+        """
+        overlapped = self._settings.qa_precheck_background and self._vlm is not None
+        pool = ThreadPoolExecutor(max_workers=1) if overlapped else None
+        future = None
+        if pool is not None:
+            future = pool.submit(
+                self._precheck,
+                redacted_image,
+                vlm_analysis,
+                ocr_result,
+                redaction_result,
             )
-
-        # ---- 第二层：VLM 语义质检 ----
-        if self._vlm is None:
-            return self._report(
-                status="failed" if damaged else "passed",
-                reason=self._build_reason(residual_texts, residual_patterns, damaged)
-                or "确定性预检未检出残留与误伤（未配置 VLM 质检）",
-                feedback=self._build_feedback(residual_texts, residual_patterns, damaged),
-                residual_texts=residual_texts,
-                residual_patterns=residual_patterns,
-                damaged_texts=damaged,
-                details=hints,
-            )
-
         try:
-            verdict = self._vlm.qa_verify(
-                original_image=original_image,
-                redacted_image=redacted_image,
-                vlm_analysis=vlm_analysis,
-                ocr_result=ocr_result,
-                feedback=feedback,
-                deterministic_hints=hints,
-                redaction_result=redaction_result,
-            )
-        except Exception as exc:
-            logger.error("VLM 质检失败：%s", exc)
+            precheck: Optional[_Precheck] = None
+            verdict = None
+            vlm_exc: Optional[Exception] = None
+
+            if self._vlm is None:
+                precheck = self._precheck(
+                    redacted_image, vlm_analysis, ocr_result, redaction_result
+                )
+            elif not overlapped:
+                precheck = self._precheck(
+                    redacted_image, vlm_analysis, ocr_result, redaction_result
+                )
+                if precheck.hard_fail:
+                    return self._precheck_failed_report(precheck)
+                verdict, vlm_exc = self._call_vlm(
+                    original_image, redacted_image, vlm_analysis, ocr_result,
+                    feedback, precheck.hints, redaction_result,
+                )
+            else:
+                verdict, vlm_exc = self._call_vlm(
+                    original_image, redacted_image, vlm_analysis, ocr_result,
+                    feedback, None, redaction_result,
+                )
+                precheck = future.result()
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+
+        # 确定性结论优先于 VLM：硬残留直接失败（与旧行为一致）
+        if precheck.hard_fail:
+            return self._precheck_failed_report(precheck)
+
+        if vlm_exc is not None:
+            logger.error("VLM 质检失败：%s", vlm_exc)
             return self._report(
                 status="failed",
-                reason=f"VLM 质检调用失败：{exc}",
+                reason=f"VLM 质检调用失败：{vlm_exc}",
                 feedback="质检调用失败，请检查 VLM 配置后重试",
-                residual_texts=residual_texts,
-                residual_patterns=residual_patterns,
-                damaged_texts=damaged,
-                details=hints,
+                residual_texts=precheck.residual_texts,
+                residual_patterns=precheck.residual_patterns,
+                damaged_texts=precheck.damaged,
+                details=precheck.hints,
+            )
+
+        if verdict is None:  # 未配置 VLM 质检
+            return self._report(
+                status="failed" if precheck.damaged else "passed",
+                reason=self._build_reason(
+                    precheck.residual_texts, precheck.residual_patterns, precheck.damaged
+                )
+                or "确定性预检未检出残留与误伤（未配置 VLM 质检）",
+                feedback=self._build_feedback(
+                    precheck.residual_texts, precheck.residual_patterns, precheck.damaged
+                ),
+                residual_texts=precheck.residual_texts,
+                residual_patterns=precheck.residual_patterns,
+                damaged_texts=precheck.damaged,
+                details=precheck.hints,
             )
 
         return self._report(
@@ -126,11 +160,92 @@ class QaTool:
             reason=verdict.reason,
             feedback=verdict.feedback,
             residual_texts=verdict.residual_block_ids,
-            residual_patterns=residual_patterns,
-            damaged_texts=verdict.damaged_block_ids or damaged,
-            details={**hints, "revised_block_ids": verdict.revised_block_ids},
+            residual_patterns=precheck.residual_patterns,
+            damaged_texts=verdict.damaged_block_ids or precheck.damaged,
+            details={**precheck.hints, "revised_block_ids": verdict.revised_block_ids},
             revised_block_ids=verdict.revised_block_ids,
         )
+
+    # ------------------------------------------------------------------ 内部
+
+    def _precheck(
+        self,
+        redacted_image: bytes,
+        vlm_analysis: VlmAnalysis,
+        ocr_result: Optional[OcrResult],
+        redaction_result: Optional[RedactionResult],
+    ) -> "_Precheck":
+        """确定性预检：重 OCR 残留 + 正则兜底 + 几何误伤。零成本、无网络。"""
+        # 重 OCR 前先按 QA_REOCR_MAX_SIDE 压分辨率：这一轮只用于文字
+        # 比对（残留/正则），不产出坐标；同时跳过方向检测——脱敏图本来
+        # 就在转正坐标系里，再检测既费一次推理，也可能把文本转到错误
+        # 方向让兜底静默失效。
+        re_ocr = self._ocr.extract(
+            image_bytes=_cap_side(redacted_image, self._settings.qa_reocr_max_side),
+            detect_orientation=False,
+        )
+        re_texts = [b.text for b in re_ocr.blocks]
+        drawn_texts = (
+            [rb.text for rb in redaction_result.redacted_blocks if rb.text]
+            if redaction_result
+            else []
+        )
+
+        residual_texts = self._find_residuals(vlm_analysis, re_texts)
+        residual_patterns = self._find_patterns(re_texts, drawn_texts)
+        damaged = self._find_collateral(vlm_analysis, ocr_result, redaction_result)
+        return _Precheck(
+            residual_texts=residual_texts,
+            residual_patterns=residual_patterns,
+            damaged=damaged,
+            hints={
+                "re_ocr_blocks": re_texts,
+                "residual_block_ids": residual_texts,
+                "pattern_hits": residual_patterns,
+                "damaged_block_ids": damaged,
+            },
+        )
+
+    def _precheck_failed_report(self, precheck: "_Precheck") -> QaReport:
+        """硬残留：确定性证据充分，直接判失败（不依赖 VLM 结论）。"""
+        return self._report(
+            status="failed",
+            reason=self._build_reason(
+                precheck.residual_texts, precheck.residual_patterns, precheck.damaged
+            ),
+            feedback=self._build_feedback(
+                precheck.residual_texts, precheck.residual_patterns, precheck.damaged
+            ),
+            residual_texts=precheck.residual_texts,
+            residual_patterns=precheck.residual_patterns,
+            damaged_texts=precheck.damaged,
+            details=precheck.hints,
+        )
+
+    def _call_vlm(
+        self,
+        original_image: bytes,
+        redacted_image: bytes,
+        vlm_analysis: VlmAnalysis,
+        ocr_result: Optional[OcrResult],
+        feedback: Optional[str],
+        deterministic_hints: Optional[dict],
+        redaction_result: Optional[RedactionResult],
+    ):
+        """调用 VLM 语义质检，返回 (verdict, 异常)。异常不外抛，由调用方判定。"""
+        try:
+            verdict = self._vlm.qa_verify(
+                original_image=original_image,
+                redacted_image=redacted_image,
+                vlm_analysis=vlm_analysis,
+                ocr_result=ocr_result,
+                feedback=feedback,
+                deterministic_hints=deterministic_hints,
+                redaction_result=redaction_result,
+            )
+            return verdict, None
+        except Exception as exc:  # noqa: BLE001 - 统一转为报告字段
+            return None, exc
 
     # ------------------------------------------------------------------ 第一层检测
 
@@ -286,6 +401,37 @@ class QaTool:
 
 
 # ---------------------------------------------------------------- 辅助
+
+
+def _cap_side(image_bytes: bytes, max_side: int) -> bytes:
+    """长边超过 max_side 时等比缩小；失败/未超限时返回原字节。
+
+    只用于质检重 OCR：识别成本随像素面积增长，而这一轮的输出只参与
+    文字匹配，不参与坐标计算（遮罩坐标来自首轮 OCR）。
+    """
+    if not max_side or max_side <= 0:
+        return image_bytes
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            longest = max(img.size)
+            if longest <= max_side:
+                return image_bytes
+            fmt = (img.format or "PNG").upper()
+            work = img.convert("RGB")
+            ratio = max_side / longest
+            work = work.resize(
+                (max(1, round(work.width * ratio)), max(1, round(work.height * ratio))),
+                Image.LANCZOS,
+            )
+        buf = BytesIO()
+        if fmt == "JPEG":
+            work.save(buf, format="JPEG", quality=95, optimize=True)
+        else:
+            work.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+    except Exception as exc:  # 预处理不做故障点：失败就用原图
+        logger.warning("质检重 OCR 缩小跳过（%s: %s）", type(exc).__name__, exc)
+        return image_bytes
 
 
 def _digit_runs(text: str, min_len: int) -> List[str]:

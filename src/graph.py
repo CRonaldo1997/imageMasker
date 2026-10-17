@@ -36,6 +36,13 @@ def route_after_qa(state: RedactionState) -> str:
     if not state.get("qa_enabled", True):
         return "end"
 
+    # 重试轮里上游节点失败时必须结束：此时 qa_node 短路返回 {}，
+    # qa_report 仍是上一轮那份 failed 报告。只看 qa_report 会误判为
+    # “还要重试”，而 vlm/redact/qa 全部短路后路由不变，形成空转循环，
+    # 最终撞 recursion_limit 才报错（错误信息还会掩盖真实原因）。
+    if state.get("status") == "failed":
+        return "end"
+
     report = state.get("qa_report")
     if report is None:  # 质检未执行（如上游失败），直接结束
         return "end"

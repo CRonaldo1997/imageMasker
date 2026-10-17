@@ -20,7 +20,7 @@ import logging
 import re
 import threading
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -39,6 +39,9 @@ from src.schemas.vlm_analysis import (
 
 logger = logging.getLogger(__name__)
 
+#: 透传发送时使用的 MIME（键为 PIL format 名）
+_MIME_BY_FORMAT = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+
 # 结构化输出重试次数：ToolStrategy 仍可能产出坏字段（类型不符 / 缺必填 /
 # 枚举越界）导致 ValidationError，这里最多尝试 3 次，全部失败才抛
 # StructuredOutputError，由节点决定如何降级（而不是让整条流水线崩掉）。
@@ -53,6 +56,16 @@ _RETRY_HINT = (
 
 class StructuredOutputError(RuntimeError):
     """LLM 多次重试后仍无法产出符合 schema 的结构化输出。"""
+
+
+def _looks_like_param_rejection(exc: Exception) -> bool:
+    """错误是否「长得像 extra_body 参数被服务端拒绝」。
+
+    超时/限流/5xx 等瞬时故障返回 False——那些情况不该动思考模式参数，
+    否则一次网络抖动就可能把关闭思考的候选写法耗尽，之后整批都开着思考跑。
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _PARAM_REJECTION_MARKERS)
 
 
 SYSTEM_PROMPT = """你是医疗票据隐私脱敏专家。给你一张医疗票据图片，以及 OCR 识别出的文字块（JSON 数组，含 block_id / text / bbox），请判断哪些文字块包含患者隐私信息、需要脱敏。
@@ -72,9 +85,10 @@ SYSTEM_PROMPT = """你是医疗票据隐私脱敏专家。给你一张医疗票�
 3. value 必须是块文本中敏感值的精确子串：块文本"姓名：张三"时 value 为"张三"；
    块文本"地址：江苏省南京市鼓楼区中山路100号"时 value 为"江苏省南京市鼓楼区中山路100号"；
 4. bbox 直接复制该块在输入 JSON 中的坐标，不要自己估算；
-5. method 固定 white_mask；
+5. 不需要判断脱敏方式（method 保持默认即可，实际方式由系统配置决定）；
 6. 给出简短判断理由；
-7. 保守判断：拿不准是否敏感时，倾向脱敏。"""
+7. 保守判断：拿不准是否敏感时，倾向脱敏；
+8. 直接给出结论，不要输出任何思考/推理过程。"""
 
 QA_SYSTEM_PROMPT = """你是医疗票据脱敏质检专家。给你原图、当前脱敏图（mask 图）、OCR 文字块（JSON 数组）以及当前被判为敏感的块列表（JSON），请判断脱敏是否合格。
 
@@ -97,23 +111,63 @@ QA_SYSTEM_PROMPT = """你是医疗票据脱敏质检专家。给你原图、当�
 - residual_block_ids：mask 图中仍可识别的敏感块 ID；
 - damaged_block_ids：被误遮挡的非敏感块 ID；
 - revised_block_ids：你复判后认为应当脱敏的块 ID 全集（供下一轮修正使用）。
+
+直接给出结论，不要输出任何思考/推理过程。
 """
 
 
+#: 关闭 Qwen3 思考模式的 extra_body 候选写法。
+#: 不同 vLLM / 兼容端点版本接受的字段名不同，按顺序试探，第一个被服务端
+#: 接受的即固定下来；全部被拒才放弃（并打 ERROR，绝不静默开思考）。
+
+#: 只有「长得像参数被拒」的错误才触发换写法：超时/限流/5xx 等瞬时错误
+#: 不能顺手把思考模式关掉的能力耗尽（那会静默退化成开着思考跑批）。
+_PARAM_REJECTION_MARKERS = (
+    "chat_template_kwargs",
+    "enable_thinking",
+    "extra_body",
+    "unexpected keyword",
+    "unsupported",
+    "unrecognized",
+    "additional properties",
+    "400",
+    "422",
+    "bad request",
+    "unprocessable",
+    "invalid",
+)
+_THINKING_OFF_PAYLOADS: Tuple[dict, ...] = (
+    {"chat_template_kwargs": {"enable_thinking": False}},  # vLLM 主流写法
+    {"enable_thinking": False},                            # 部分版本/兼容端点
+    {"thinking": {"type": "disabled"}},                    # 另一种常见写法
+)
+
+
 class VlmTool:
-    """VLM 工具：敏感判断 + 质检语义判断。模型走 OpenAI 兼容协议。"""
+    """VLM 工具：敏感判断 + 质检语义判断。模型走 OpenAI 兼容协议。
+
+    思考模式：本项目的两次调用（敏感判断 + 语义质检）共用同一个模型实例，
+    因此共用同一份 extra_body——关闭思考模式对两条路径同时生效，不存在
+    「一条关一条没关」。若服务端不接受当前写法，会自动换下一种候选写法；
+    全部被拒时打 ERROR 日志（部署时 grep 这行即可确认），不会静默开着思考。
+    """
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._extra_body: dict = {}
-        if not settings.vlm_enable_thinking:
-            # Qwen3 系列关闭思考模式，否则输出大量推理过程、结构化输出不稳定
-            self._extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+        self._thinking_off = not settings.vlm_enable_thinking
+        # 候选写法副本：被拒绝一个就弹出一个，全部弹出即放弃
+        self._payload_candidates: List[dict] = (
+            [dict(p) for p in _THINKING_OFF_PAYLOADS] if self._thinking_off else []
+        )
+        self._extra_body: dict = (
+            dict(self._payload_candidates[0]) if self._payload_candidates else {}
+        )
         self._extra_body_disabled = False
         self._model = self._build_model()
-        # 批量模式多线程共用同一实例：降级会重建客户端并清空 extra_body，
+        # 批量模式多线程共用同一实例：降级会重建客户端并更换 extra_body，
         # 用锁串行化这段共享状态变更，避免并发下反复重建/读到半更新状态。
         self._degrade_lock = threading.Lock()
+        self._thinking_state_logged = False
 
     def _build_model(self) -> ChatOpenAI:
         return ChatOpenAI(
@@ -248,14 +302,21 @@ class VlmTool:
                     ),
                 }
             )
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": self._image_url(previous_redaction.redacted_image)
-                    },
-                }
-            )
+            # 质检失败必然有上一轮的脱敏图；但回退消息也可能被单独构造
+            # （如上游未产出 redaction_result 时），这里显式判空，避免
+            # AttributeError 把“重判”变成整图 failed。
+            if previous_redaction is not None and previous_redaction.redacted_image:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": self._image_url(
+                                previous_redaction.redacted_image,
+                                self._qa_mask_max_side(),
+                            )
+                        },
+                    }
+                )
         else:
             content.append(
                 {"type": "text", "text": user_text + "\n\n请判断哪些文字块需要脱敏。"}
@@ -284,7 +345,7 @@ class VlmTool:
             drawn = {
                 rb.block_id: rb.text
                 for rb in redaction_result.redacted_blocks
-                if rb.block_id != "qr" and rb.text
+                if rb.text
             }
             if drawn:
                 parts.append(
@@ -314,29 +375,64 @@ class VlmTool:
                     {"type": "text", "text": "\n\n".join(parts)},
                     {
                         "type": "image_url",
-                        "image_url": {"url": self._image_url(redacted_image)},
+                        "image_url": {
+                            "url": self._image_url(
+                                redacted_image, self._qa_mask_max_side()
+                            )
+                        },
                     },
                 ]
             ),
         ]
 
-    def _image_url(self, image: bytes) -> str:
-        return f"data:image/png;base64,{self._prepare_image(image)}"
+    def _image_url(self, image: bytes, max_side: Optional[int] = None) -> str:
+        payload, mime = self._prepare_image(image, max_side)
+        return f"data:{mime};base64,{payload}"
 
-    def _prepare_image(self, image: bytes) -> str:
-        """长边超过阈值时缩放，控制 VLM 输入 token；判断依据是块 ID，缩放不影响。"""
-        img = Image.open(BytesIO(image)).convert("RGB")
-        max_side = self._settings.vlm_max_image_side
-        longest = max(img.size)
-        if longest > max_side:
-            ratio = max_side / longest
-            img = img.resize(
-                (round(img.width * ratio), round(img.height * ratio)),
+    def _qa_mask_max_side(self) -> int:
+        """质检用「脱敏图」的长边上限（0/负数表示跟随原图上限）。"""
+        side = self._settings.vlm_qa_mask_image_side
+        return side if side and side > 0 else self._settings.vlm_max_image_side
+
+    def _prepare_image(
+        self, image: bytes, max_side: Optional[int] = None
+    ) -> Tuple[str, str]:
+        """返回 (base64 载荷, MIME)。
+
+        - 长边超过阈值时缩放：vision token 按像素面积计，是 VLM 输入
+          成本的大头，判断依据是块 ID，缩放不影响结论；
+        - 未超阈值、且是 JPEG/PNG/WEBP、且无 EXIF 方向标记时**原样透传**：
+          省掉一次解码+重编码，也避免把 JPEG 膨胀成 PNG 再 base64；
+        - 其它情况按 PNG 重编码——顺带剥掉 EXIF 方向，防止服务端按
+          EXIF 旋转后与我们的遮罩坐标不一致。
+        """
+        if max_side is None:
+            max_side = self._settings.vlm_max_image_side
+        try:
+            with Image.open(BytesIO(image)) as img:
+                fmt = (img.format or "").upper()
+                orientation = int(img.getexif().get(0x0112, 1) or 1)
+                if (
+                    max(img.size) <= max_side
+                    and orientation in (0, 1)
+                    and fmt in _MIME_BY_FORMAT
+                ):
+                    # 只解析了文件头，没有解码像素
+                    return base64.b64encode(image).decode(), _MIME_BY_FORMAT[fmt]
+                work = img.convert("RGB")
+        except Exception as exc:
+            logger.warning("VLM 输入图像解码失败（%s），按原始字节发送", exc)
+            return base64.b64encode(image).decode(), "image/png"
+
+        if max(work.size) > max_side:
+            ratio = max_side / max(work.size)
+            work = work.resize(
+                (max(1, round(work.width * ratio)), max(1, round(work.height * ratio))),
                 Image.LANCZOS,
             )
         buf = BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode()
+        work.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode(), "image/png"
 
     # ------------------------------------------------------------------ 调用
 
@@ -352,12 +448,13 @@ class VlmTool:
         ToolStrategy 仍可能产出坏字段（类型不符 / 缺必填 / 枚举越界），因此：
         1. 最多重试 STRUCTURED_OUTPUT_ATTEMPTS 次，每次追加纠正提示；
         2. 模型把对象包成 list 的怪癖直接解包，不浪费一次重试；
-        3. extra_body 不被服务端接受时自动降级一次；
+        3. extra_body 不被服务端接受时自动换下一种关闭思考的写法（最多 3 种）；
         4. 重试耗尽后走一次 JSON 文本兜底；
         5. 仍失败才抛 StructuredOutputError，由节点降级而非让程序崩溃。
         """
         from pydantic import ValidationError
 
+        self._log_thinking_state_once()
         last_exc: Optional[Exception] = None
         current = messages
         for attempt in range(1, STRUCTURED_OUTPUT_ATTEMPTS + 1):
@@ -410,15 +507,58 @@ class VlmTool:
         return None
 
     def _degrade_extra_body(self, exc: Exception) -> None:
-        """vLLM 旧版本不认识 chat_template_kwargs 等 extra_body 时去掉重试。"""
+        """当前 extra_body 不被服务端接受：换下一种关闭思考的写法，全部试完才放弃。
+
+        只在错误「长得像参数被拒」时动作：超时/限流/5xx 等瞬时故障不该
+        把关闭思考的候选写法耗尽（那等于静默开着思考跑完剩下的图）。
+        每次更换/放弃都打 ERROR，部署时 grep 这行即可确认到底关没关掉。
+        """
+        if not _looks_like_param_rejection(exc):
+            logger.warning(
+                "VLM 调用失败但与关闭思考的参数无关（%s: %s），保留当前参数重试",
+                type(exc).__name__, exc,
+            )
+            return
         with self._degrade_lock:
-            if self._extra_body and not self._extra_body_disabled:
-                logger.warning(
-                    "带 extra_body 的调用失败（%s）；降级去掉 extra_body", exc
+            # 无需关闭思考（显式开启），或已经放弃过 → 不再动作
+            if not self._thinking_off or self._extra_body_disabled:
+                return
+            current = self._extra_body
+            if current in self._payload_candidates:
+                self._payload_candidates.remove(current)
+            if self._payload_candidates:
+                self._extra_body = self._payload_candidates.pop(0)
+                logger.error(
+                    "关闭思考模式的参数 %s 不被服务端接受（%s）；改试 %s",
+                    current, exc, self._extra_body,
                 )
+            else:
                 self._extra_body = {}
                 self._extra_body_disabled = True
-                self._model = self._build_model()
+                logger.error(
+                    "关闭思考模式的所有参数写法均被服务端拒绝（最后一次：%s）；"
+                    "已放弃下发该参数——Qwen3 将输出思考 token：结构化输出不稳定、"
+                    "单张耗时显著上升。请升级 vLLM，或设 VLM_ENABLE_THINKING=true "
+                    "并在 prompt 层约束（不推荐）。",
+                    exc,
+                )
+            self._model = self._build_model()
+            self._thinking_state_logged = False
+
+    def _log_thinking_state_once(self) -> None:
+        """首次调用前把思考模式的实际状态打出来，便于部署后核对。"""
+        if self._thinking_state_logged:
+            return
+        self._thinking_state_logged = True
+        if not self._thinking_off:
+            logger.warning(
+                "VLM_ENABLE_THINKING=true：思考模式处于开启状态（显式配置），"
+                "结构化输出可能不稳定、单张更慢"
+            )
+        elif self._extra_body:
+            logger.info("VLM 思考模式：已关闭（extra_body=%s）", self._extra_body)
+        else:
+            logger.error("VLM 思考模式：未能关闭（参数均被服务端拒绝）")
 
     def _invoke_json_fallback(self, messages: List, schema):
         resp = self._model.invoke(messages)

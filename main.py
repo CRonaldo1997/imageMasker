@@ -19,12 +19,34 @@ from typing import Optional
 from src.config import PROJECT_ROOT
 from src.graph import build_graph, compute_recursion_limit
 from src.graph_state import RedactionState
-from src.image_preprocess import DEFAULT_MAX_IMAGE_BYTES, maybe_shrink
+from src.image_preprocess import (
+    DEFAULT_MAX_IMAGE_BYTES,
+    maybe_shrink,
+    normalize_exif_orientation,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 logger = logging.getLogger("main")
+
+
+def ensure_utf8_stdio() -> None:
+    """ASCII locale 下把标准输出切到 UTF-8。
+
+    服务器常用 LANG=C / LC_ALL=POSIX（无 UTF-8），此时 tqdm 的
+    "脱敏进度" 与中文日志会抛 UnicodeEncodeError，前台跑批直接中断。
+    只在编码确实是 ASCII 时切换，避免影响中文 Windows 控制台。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            if (stream.encoding or "").lower() in ("ascii", "us-ascii", "ansi_x3.4-1968"):
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # 重定向到不可重配的流时保持原样
+            continue
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +106,8 @@ def run_single(
     shrink_max_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
 ) -> dict:
     """对单张图片执行脱敏流水线，返回最终状态。graph 由调用方提供（批量可复用）。"""
-    image_bytes, _ = maybe_shrink(Path(image_path).read_bytes(), shrink_max_bytes)
+    image_bytes, _ = normalize_exif_orientation(Path(image_path).read_bytes())
+    image_bytes, _ = maybe_shrink(image_bytes, shrink_max_bytes)
 
     initial_state: RedactionState = {
         "image_path": image_path,
@@ -216,6 +239,7 @@ def _load_cjk_font(size: int):
 
 
 def main() -> int:
+    ensure_utf8_stdio()
     args = parse_args()
     shrink_max_bytes = shrink_limit_bytes(args)
 
